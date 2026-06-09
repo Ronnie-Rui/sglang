@@ -156,6 +156,12 @@ class ReqState:
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
+    # The LoRA usage counter must be released exactly once per request, but a
+    # request can reach finalization through more than one path (e.g. a running
+    # request aborted with 503/500 passes through both _handle_batch_output and
+    # _handle_abort_finish_reason). Guard the release so it happens at most once.
+    lora_released: bool = False
+
     # For streaming output
     last_output_offset: int = 0
 
@@ -1378,7 +1384,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[state.obj.rid]
 
             # Mark ongoing LoRA request as finished.
-            if self.server_args.enable_lora and state.obj.lora_path:
+            if (
+                self.server_args.enable_lora
+                and state.obj.lora_path
+                and not state.lora_released
+            ):
+                state.lora_released = True
                 await self.lora_registry.release(state.obj.lora_id)
             if not is_stream:
                 raise fastapi.HTTPException(
@@ -2047,7 +2058,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
-                if self.server_args.enable_lora and state.obj.lora_path:
+                if (
+                    self.server_args.enable_lora
+                    and state.obj.lora_path
+                    and not state.lora_released
+                ):
+                    state.lora_released = True
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             if out_dict is not None:
