@@ -1,3 +1,4 @@
+import inspect
 from typing import Dict, List, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
@@ -1124,7 +1125,14 @@ class ReasoningParser:
             kwargs["previous_content"] = request.messages[-1].content
 
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
-        if chat_template_kwargs.get("force_nonempty_content") is True:
+        if (
+            chat_template_kwargs.get("force_nonempty_content") is True
+            and "force_nonempty_content"
+            in inspect.signature(detector_class.__init__).parameters
+        ):
+            # Only forward this kwarg to detectors that actually accept it
+            # (currently only Nemotron3Detector); other detectors would raise
+            # TypeError on an unexpected keyword argument.
             kwargs["force_nonempty_content"] = True
 
         self.detector = detector_class(**kwargs)
