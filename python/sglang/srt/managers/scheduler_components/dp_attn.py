@@ -105,14 +105,14 @@ class MLPSyncBatchInfo:
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
+        cpu_data = tp0_info.cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
-        self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
-        self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
+        self.can_cuda_graph = bool(cpu_data[:, 2].min().item())
+        self.is_extend_in_batch = bool(cpu_data[:, 3].max().item())
+        self.can_run_breakable_cuda_graph = bool(cpu_data[:, 6].min().item())
         if _ENABLE_METRICS_DP_ATTENTION:
-            self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
+            self.dp_cooperation_info = DPCooperationInfo.create(cpu_data[:, 5].tolist())
 
 
 def _update_gather_batch(
