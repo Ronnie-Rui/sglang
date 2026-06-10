@@ -938,7 +938,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.capture_hidden_mode != required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.backend.cleanup()
-            self.capture()
+            with model_capture_mode():
+                self.capture()
 
     # -----------------------------------------------------------------
     # replay_prepare
