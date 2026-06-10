@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
-from sglang.srt.layers.quantization.utils import requantize_with_max_scale
+from sglang.srt.layers.quantization.utils import convert_to_channelwise
 from sglang.srt.utils import is_cuda
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
@@ -101,17 +101,16 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
 
     def process_weights_after_loading(self, layer) -> None:
         # If per tensor, when we have a fused module (e.g. QKV) with per
-        # tensor scales (thus N scales being passed to the kernel),
-        # requantize so we can always run per channel
+        # tensor scales (thus N scales being passed to the kernel), expand
+        # the scalar scales into per-channel scales so we can always run per
+        # channel. The int8 weight data must not be touched.
         if self.strategy == QuantizationStrategy.TENSOR:
-            max_w_scale, weight = requantize_with_max_scale(
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                logical_widths=layer.logical_widths,
+            weight_scale = convert_to_channelwise(
+                layer.weight_scale, layer.logical_widths
             )
 
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
         # If channelwise, scales are already lined up, so just transpose.
         elif self.strategy == QuantizationStrategy.CHANNEL:
