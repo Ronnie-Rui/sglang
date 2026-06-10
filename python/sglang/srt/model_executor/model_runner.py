@@ -1664,6 +1664,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         target_device = torch.device(self.device)
+        original_model_path = self.model_config.model_path
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
@@ -1702,8 +1703,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 del iter
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                self.model = model_load_weights(self.model, iter)
+                # Roll back to the original weights: restore the original
+                # model path before rebuilding the weight iterator, otherwise
+                # we would reload the same (failed) new checkpoint instead of
+                # the original model.
+                self.model_config.model_path = original_model_path
+                try:
+                    iter = get_weight_iter(self.model_config)
+                    self.model = model_load_weights(self.model, iter)
+                except Exception as rollback_err:
+                    return False, (
+                        f"{message}\nRollback ALSO failed: {rollback_err}. "
+                        f"Engine weights may be in an inconsistent state."
+                    )
                 return False, message
 
         self.model = model
