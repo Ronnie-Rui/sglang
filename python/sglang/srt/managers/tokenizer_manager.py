@@ -2660,6 +2660,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         del self.rid_to_state[recv_obj.rid]
 
+        # Release the LoRA usage counter for waiting-queue aborts that are NOT
+        # released by _handle_abort_finish_reason, which only releases when the
+        # status_code is SERVICE_UNAVAILABLE or INTERNAL_SERVER_ERROR. This
+        # covers the default "Abort in waiting queue" and BAD_REQUEST cases,
+        # whose counter would otherwise leak forever and eventually block
+        # unload_lora_adapter. The status_code gate keeps this mutually
+        # exclusive with that finalizer so it can never double-release.
+        if (
+            self.server_args.enable_lora
+            and getattr(state.obj, "lora_path", None)
+            and finish_reason.get("status_code")
+            not in (
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        ):
+            asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+
         state.out_list.append(out)
         state.event.set()
 
