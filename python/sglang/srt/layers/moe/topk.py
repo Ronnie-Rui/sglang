@@ -685,6 +685,18 @@ def fused_topk_cpu(
             scoring_func=scoring_func,
         )
 
+    if correction_bias is not None:
+        # topk_softmax_cpu does not accept a correction bias, so passing it
+        # through would silently drop it. Fall back to the reference torch
+        # implementation (correct on CPU) to honor the bias.
+        return fused_topk_torch_native(
+            hidden_states,
+            gating_output,
+            topk,
+            renormalize,
+            correction_bias=correction_bias,
+            scoring_func=scoring_func,
+        )
     topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
         hidden_states=hidden_states,
         gating_output=gating_output,
@@ -727,6 +739,22 @@ def fused_topk(
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
     if scoring_func == "softmax":
+        if correction_bias is not None:
+            # The fused softmax paths (CUDA topk_softmax and the aiter kernel)
+            # compute softmax(logits + bias) and use it for both expert
+            # selection and weighting, silently dropping the decoupled
+            # "select with softmax(logits) + bias, weight with unbiased
+            # softmax(logits)" semantics required by models such as ERNIE-4.5.
+            # Fall back to the reference torch implementation so the correction
+            # bias is honored.
+            return fused_topk_torch_native(
+                hidden_states,
+                gating_output,
+                topk,
+                renormalize,
+                correction_bias=correction_bias,
+                scoring_func=scoring_func,
+            )
         if _use_aiter:
 
             # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
