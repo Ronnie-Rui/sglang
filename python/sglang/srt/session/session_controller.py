@@ -139,8 +139,14 @@ class Session:
                 last_req = last_req_node.req
         elif session_params.replace:
             if session_params.rid is None:
-                for _, req_node in self.req_nodes.items():
-                    req_node.clear(self.req_nodes)
+                # Clear the entire session history: abort every node first,
+                # then clear the dict in one shot. Calling req_node.clear()
+                # while iterating self.req_nodes deletes keys from the dict
+                # being iterated, which raises
+                # "RuntimeError: dictionary changed size during iteration".
+                for req_node in self.req_nodes.values():
+                    req_node.abort()
+                self.req_nodes.clear()
             else:
                 if session_params.rid not in self.req_nodes:
                     abort = True
