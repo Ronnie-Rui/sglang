@@ -144,21 +144,27 @@ class LoRARegistry:
         if isinstance(lora_name, str):
             async with self._registry_lock.writer_lock:
                 lora_id = _lookup(lora_name)
-
-            await self._counters[lora_id].increment(notify_all=False)
+                # Increment the counter within the same critical section as the
+                # lookup so that it is serialized with unregister(). This prevents
+                # a concurrent unload from observing a zero counter and unloading
+                # an adapter that an in-flight request has already acquired.
+                await self._counters[lora_id].increment(notify_all=False)
             return lora_id
         elif isinstance(lora_name, list):
             async with self._registry_lock.writer_lock:
                 lora_ids = [_lookup(name) for name in lora_name]
 
-            # Increment the counters only after all IDs are looked up.
-            await asyncio.gather(
-                *[
-                    self._counters[id].increment(notify_all=False)
-                    for id in lora_ids
-                    if id is not None
-                ]
-            )
+                # Increment the counters within the same critical section as the
+                # lookups so that they are serialized with unregister(), avoiding
+                # a race where a concurrent unload unloads an adapter that an
+                # in-flight request has already acquired.
+                await asyncio.gather(
+                    *[
+                        self._counters[id].increment(notify_all=False)
+                        for id in lora_ids
+                        if id is not None
+                    ]
+                )
             return lora_ids
         else:
             raise TypeError("lora_name must be either a string or a list of strings.")
