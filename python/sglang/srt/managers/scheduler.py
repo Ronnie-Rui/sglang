@@ -39,6 +39,7 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.srt.arg_groups.hisparse_hook import use_runtime_sparse_attention
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -356,7 +357,10 @@ class Scheduler(
             and self.enable_hierarchical_cache
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
-        self.enable_hisparse = server_args.enable_hisparse
+        self.enable_hisparse = (
+            server_args.enable_hisparse
+            and not use_runtime_sparse_attention(server_args)
+        )
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
 

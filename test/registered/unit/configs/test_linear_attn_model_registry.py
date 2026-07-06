@@ -9,6 +9,11 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_spec_by_arch,
     import_backend_class,
     register_linear_attn_model,
+    resolve_hybrid_gdn_config,
+    resolve_hybrid_lightning_config,
+    resolve_kimi_linear_config,
+    resolve_mamba2_config,
+    resolve_mambaish_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -96,6 +101,53 @@ class TestLinearAttnModelRegistry(CustomTestCase):
         # VLM wrapper itself is not a FakeLinearAttnConfig, so no match
         result = get_linear_attn_config(vlm_config)
         self.assertIsNone(result)
+
+    def test_resolve_builtin_linear_attention_categories(self):
+        from sglang.srt.configs import (
+            BailingHybridConfig,
+            FalconH1Config,
+            KimiLinearConfig,
+            Qwen3NextConfig,
+        )
+
+        gdn = Qwen3NextConfig()
+        mamba2 = FalconH1Config()
+        kimi = KimiLinearConfig(
+            linear_attn_config={"kda_layers": [1], "full_attn_layers": [2]}
+        )
+        lightning = BailingHybridConfig()
+
+        self.assertIs(resolve_hybrid_gdn_config(gdn), gdn)
+        self.assertIs(resolve_mamba2_config(mamba2), mamba2)
+        self.assertIs(resolve_kimi_linear_config(kimi), kimi)
+        self.assertIs(resolve_hybrid_lightning_config(lightning), lightning)
+        for config in (gdn, mamba2, kimi, lightning):
+            self.assertIs(resolve_mambaish_config(config), config)
+
+    def test_resolve_mamba2_preserves_model_specific_exceptions(self):
+        from sglang.srt.configs import GraniteMoeHybridConfig, NemotronHConfig
+
+        attention_only = GraniteMoeHybridConfig(
+            num_hidden_layers=2, layer_types=["attention", "attention"]
+        )
+        mixed = GraniteMoeHybridConfig(
+            num_hidden_layers=2, layer_types=["mamba", "attention"]
+        )
+        self.assertIsNone(resolve_mamba2_config(attention_only))
+        self.assertIs(resolve_mamba2_config(mixed), mixed)
+
+        nemotron = NemotronHConfig()
+        nemotron.mtp_hybrid_override_pattern = "*E"
+        self.assertIs(resolve_mamba2_config(nemotron), nemotron)
+        self.assertIsNone(resolve_mamba2_config(nemotron, is_draft_worker=True))
+
+    def test_resolve_mambaish_falls_back_to_external_registry(self):
+        spec = self._make_spec()
+        register_linear_attn_model(spec)
+        config = FakeLinearAttnConfig()
+
+        self.assertIs(resolve_mambaish_config(config), config)
+        self.assertIsNone(resolve_mambaish_config(AnotherConfig()))
 
     def test_lookup_by_arch(self):
         spec = self._make_spec(arch_names=["AlphaForCausalLM", "BetaForCausalLM"])

@@ -2122,7 +2122,16 @@ class ServerArgs:
     hisparse_config: A[
         Optional[str],
         Arg(
-            help='A dictionary in JSON string format for hierarchical sparse attention configuration. Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
+            help=(
+                "A dictionary in JSON string format for hierarchical sparse "
+                "attention configuration. Example: "
+                '\'{"top_k": 2048, "device_buffer_size": 4096, '
+                '"host_to_device_ratio": 2}\'. For Quest runtime attention, '
+                "use e.g. "
+                '\'{"algorithm":"quest","backend":"fa3","page_size":16,'
+                '"sparsity_ratio":0.5}\'. The Quest page_size also configures '
+                "the runtime KV page size; an explicit --page-size must match it."
+            ),
             aliases=["--hierarchical-sparse-attention-extra-config"],
         ),
     ] = None
@@ -7051,6 +7060,12 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _hisparse_validation)
+
+        from sglang.srt.arg_groups.hisparse_hook import (
+            apply_runtime_sparse_cuda_graph_defaults,
+        )
+
+        apply_runtime_sparse_cuda_graph_defaults(self)
 
         assert (
             self.schedule_conservativeness >= 0

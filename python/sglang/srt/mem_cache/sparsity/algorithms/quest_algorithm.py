@@ -147,18 +147,21 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
 
         kv_heads = k_min.shape[-2]
         q_heads = q.shape[1]
-        if q_heads != kv_heads:
-            if q_heads % kv_heads != 0:
-                raise ValueError(
-                    f"Query heads {q_heads} not divisible by KV heads {kv_heads}"
-                )
-            group = q_heads // kv_heads
-            # Average grouped query heads to align with KV heads (approximation for MQA/GQA).
-            q = q.view(q.shape[0], kv_heads, group, head_dim).mean(dim=2)
+        if q_heads % kv_heads != 0:
+            raise ValueError(
+                f"Query heads {q_heads} not divisible by KV heads {kv_heads}"
+            )
 
-        q = q.to(k_min.dtype).unsqueeze(1)  # [bs, 1, kv_heads, head_dim]
-
-        criticality = torch.where(q >= 0, q * k_max, q * k_min).sum(dim=(2, 3))
+        # FlashAttention uses one page table per request, shared by all query
+        # heads. Compute each head's bounding-box upper bound independently,
+        # then use the largest bound as the conservative shared-page score.
+        group = q_heads // kv_heads
+        q = q.view(q.shape[0], kv_heads, group, head_dim)
+        q = q.to(k_min.dtype).unsqueeze(1)
+        k_min = k_min.unsqueeze(3)
+        k_max = k_max.unsqueeze(3)
+        per_head_bound = torch.where(q >= 0, q * k_max, q * k_min).sum(dim=-1)
+        criticality = per_head_bound.amax(dim=(2, 3))
         criticality = torch.where(
             valid_mask, criticality, torch.full_like(criticality, float("-inf"))
         )

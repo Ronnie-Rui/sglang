@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.arg_groups.hisparse_hook import get_hisparse_algorithm
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
@@ -135,6 +136,20 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = mr.num_effective_layers
 
         self._cell_size = self._compute_cell_size(mr, num_layers)
+
+        self._runtime_sparse_representation_bytes_per_page = 0
+        if (
+            getattr(mr, "enable_runtime_sparse_attention", False) is True
+            and get_hisparse_algorithm(mr.server_args) == "quest"
+        ):
+            kv_heads = mr.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+            # Quest stores FP32 key minima/maxima and one validity bit (materialized
+            # as torch.bool) for every local layer and physical KV page.
+            local_layers = mr.end_layer - mr.start_layer
+            self._runtime_sparse_representation_bytes_per_page = local_layers * (
+                2 * kv_heads * mr.model_config.head_dim * torch.float32.itemsize
+                + torch.bool.itemsize
+            )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -279,8 +294,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = available_bytes // self._cell_size
-        max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        representation_page_bytes = self._runtime_sparse_representation_bytes_per_page
+        if representation_page_bytes:
+            # The KV pool allocates ``max_tokens + page_size`` slots. Quest builds
+            # one representation for that padding page as well, so reserve its
+            # fixed cost before solving for the remaining complete pages.
+            available_for_pages = max(0, available_bytes - representation_page_bytes)
+            combined_page_bytes = (
+                page_size * self._cell_size + representation_page_bytes
+            )
+            max_total_num_tokens = (
+                available_for_pages // combined_page_bytes * page_size
+            )
+        else:
+            max_total_num_tokens = available_bytes // self._cell_size
+            max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
     def calculate_pool_sizes_from_max_tokens(

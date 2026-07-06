@@ -32,26 +32,17 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.srt.configs import (
-    BailingHybridConfig,
-    FalconH1Config,
-    GraniteMoeHybridConfig,
-    InternS2PreviewConfig,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiLinearConfig,
-    Lfm2Config,
-    Lfm2MoeConfig,
-    Lfm2VlConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
-    Qwen3NextConfig,
-    ZayaConfig,
-)
+from sglang.srt.arg_groups.hisparse_hook import use_runtime_sparse_attention
+from sglang.srt.configs import Qwen3NextConfig
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.linear_attn_model_registry import (
+    get_linear_attn_config,
+    resolve_builtin_mambaish_config,
+    resolve_hybrid_gdn_config,
+    resolve_hybrid_lightning_config,
+    resolve_kimi_linear_config,
+    resolve_mamba2_config,
+)
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -410,7 +401,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        self.enable_runtime_sparse_attention = use_runtime_sparse_attention(server_args)
+        self.enable_hisparse = (
+            server_args.enable_hisparse and not self.enable_runtime_sparse_attention
+        )
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -577,6 +571,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
+        self.runtime_sparse_coordinator = None
 
         self._linear_attn_registry_cache: Any = _UNSET
 
@@ -883,6 +878,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            )
+
+        if self.enable_runtime_sparse_attention:
+            from sglang.srt.mem_cache.sparsity import create_sparse_coordinator
+
+            self.runtime_sparse_coordinator = create_sparse_coordinator(
+                device=self.device,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                server_args=self.server_args,
             )
 
         self.init_routed_experts_capturer()
@@ -2282,59 +2289,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def hybrid_lightning_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, BailingHybridConfig):
-            return config
-        return None
+        return resolve_hybrid_lightning_config(self.model_config.hf_config)
 
     @property
     def hybrid_gdn_config(self):
-        config = self.model_config.hf_config.get_text_config()
-        if isinstance(
-            config,
-            Qwen3NextConfig
-            | Qwen3_5Config
-            | Qwen3_5MoeConfig
-            | InternS2PreviewConfig
-            | JetNemotronConfig
-            | JetVLMConfig,
-        ):
-            return config
-        return None
+        return resolve_hybrid_gdn_config(self.model_config.hf_config)
 
     @property
     def mamba2_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, NemotronHConfig) and self.is_draft_worker:
-            # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
-            # so they shouldn't use HybridLinearAttnBackend
-            pattern = getattr(config, "mtp_hybrid_override_pattern", None)
-            if pattern is not None and "M" not in pattern:
-                return None
-        if isinstance(
-            config,
-            FalconH1Config
-            | NemotronHConfig
-            | Lfm2Config
-            | Lfm2MoeConfig
-            | Lfm2VlConfig
-            | ZayaConfig,
-        ):
-            return config
-        if isinstance(config, NemotronH_Nano_VL_V2_Config):
-            return config.llm_config
-
-        if isinstance(config, GraniteMoeHybridConfig):
-            has_mamba = any(
-                layer_type == "mamba"
-                for layer_type in getattr(config, "layer_types", [])
-            )
-            if not has_mamba:
-                return None
-            else:
-                return config
-
-        return None
+        return resolve_mamba2_config(
+            self.model_config.hf_config, is_draft_worker=self.is_draft_worker
+        )
 
     @property
     def max_token_pool_size(self):
@@ -2346,10 +2311,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def kimi_linear_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, KimiLinearConfig):
-            return config
-        return None
+        return resolve_kimi_linear_config(self.model_config.hf_config)
 
     def _get_linear_attn_registry_result(self):
         if self._linear_attn_registry_cache is _UNSET:
@@ -2365,14 +2327,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def mambaish_config(self):
-        existing = (
-            self.mamba2_config
-            or self.hybrid_gdn_config
-            or self.kimi_linear_config
-            or self.hybrid_lightning_config
+        builtin_config = resolve_builtin_mambaish_config(
+            self.model_config.hf_config, is_draft_worker=self.is_draft_worker
         )
-        if existing:
-            return existing
+        if builtin_config is not None:
+            return builtin_config
         result = self._get_linear_attn_registry_result()
         return result[1] if result else None
 
@@ -3119,7 +3078,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
-            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+            ctx_mgr = forward_context(
+                ForwardContext(
+                    attn_backend=self.attn_backend,
+                    runtime_sparse_coordinator=self.runtime_sparse_coordinator,
+                )
+            )
         with ctx_mgr:
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph

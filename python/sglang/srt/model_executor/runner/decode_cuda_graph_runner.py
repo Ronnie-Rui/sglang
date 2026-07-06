@@ -770,7 +770,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
-        with forward_context(ForwardContext(attn_backend=attn_backend)):
+        with forward_context(
+            ForwardContext(
+                attn_backend=attn_backend,
+                runtime_sparse_coordinator=self.model_runner.runtime_sparse_coordinator,
+            )
+        ):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
             if forward_batch.lora_ids is not None:

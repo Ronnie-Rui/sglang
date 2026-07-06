@@ -198,11 +198,25 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if not forward_batch.forward_mode.is_extend():
             return
 
+        if getattr(forward_batch, "extend_prefix_lens", None) is not None:
+            new_req_mask = forward_batch.extend_prefix_lens == 0
+            if new_req_mask.any():
+                new_req_indices = req_pool_indices[new_req_mask]
+                self.states.repr_constructed[new_req_indices] = False
+                self.states.prompt_lens[new_req_indices] = 0
+                self.states.last_constructed_page[new_req_indices] = 0
+
+        prompt_lens = self.states.prompt_lens[req_pool_indices]
+        self.states.prompt_lens[req_pool_indices] = torch.maximum(prompt_lens, seq_lens)
+
         num_pages = seq_lens // self.page_size
-        valid_mask = (
-            ~self.states.repr_constructed[req_pool_indices]
-            & (seq_lens >= self.states.prompt_lens[req_pool_indices])
-            & (num_pages > 0)
+        start_page = torch.where(
+            self.states.repr_constructed[req_pool_indices],
+            self.states.last_constructed_page[req_pool_indices],
+            torch.zeros_like(num_pages),
+        )
+        valid_mask = (seq_lens >= self.states.prompt_lens[req_pool_indices]) & (
+            num_pages > start_page
         )
 
         if not valid_mask.any():
@@ -213,7 +227,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             layer_id,
             req_pool_indices[valid_mask],
             seq_lens[valid_mask],
-            0,
+            start_page[valid_mask],
             num_pages[valid_mask],
             k_buffer,
         )
@@ -232,14 +246,35 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         k_buffer,
         forward_batch,
     ) -> torch.Tensor:
-        if not forward_batch.forward_mode.is_decode_or_idle():
+        if not forward_batch.forward_mode.is_decode():
             return
 
-        start_page = self.states.last_constructed_page[req_pool_indices]
+        # A decode step can create a new complete representation page only
+        # when a sequence length lands exactly on a page boundary. Use the
+        # existing CPU mirror to skip the GPU mask reduction on all other
+        # steps (normally page_size - 1 out of every page_size iterations).
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            if torch.is_tensor(seq_lens_cpu):
+                completed_page = (seq_lens_cpu > 0) & (
+                    seq_lens_cpu % self.page_size == 0
+                )
+                if not bool(completed_page.any()):
+                    return
+            elif not any(
+                seq_len > 0 and seq_len % self.page_size == 0
+                for seq_len in seq_lens_cpu
+            ):
+                return
+
         end_page = seq_lens // self.page_size
-        valid_mask = self.states.repr_constructed[req_pool_indices] & (
-            start_page < end_page
+        constructed = self.states.repr_constructed[req_pool_indices]
+        start_page = torch.where(
+            constructed,
+            self.states.last_constructed_page[req_pool_indices],
+            torch.zeros_like(end_page),
         )
+        valid_mask = start_page < end_page
 
         if not valid_mask.any():
             return
@@ -257,6 +292,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         # Update tracking states
         if layer_id == self.end_layer - 1:
             success_indices = req_pool_indices[valid_mask]
+            self.states.repr_constructed[success_indices] = True
             self.states.last_constructed_page[success_indices] = end_page[valid_mask]
 
     def retrieve_topk(

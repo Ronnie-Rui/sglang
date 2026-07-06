@@ -46,7 +46,13 @@ from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disable
 
 
 def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
-    return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
+    from sglang.srt.arg_groups.hisparse_hook import use_runtime_sparse_attention
+
+    return bool(
+        server_args.enable_prefill_cp
+        or server_args.enable_dp_attention
+        or use_runtime_sparse_attention(server_args)
+    )
 
 
 @triton.jit
@@ -366,7 +372,8 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         # Skip the FA3 scheduler_metadata precompute (PR #21104) when distributed
-        # attention modes can change live cache_seqlens/num_splits across ranks.
+        # attention modes or runtime sparse attention can change live
+        # cache_seqlens/num_splits across ranks or layers.
         # A stale precomputed buffer can lead to an OOB read in the split-KV
         # combine kernel (flash_fwd_combine_launch_template.h:52). Leaving
         # scheduler_metadata unset uses the existing per-layer metadata path.

@@ -80,10 +80,19 @@ class FlashAttentionAdaptor(BackendAdaptor):
     """Adaptor for FlashAttention backend."""
 
     def save_original_metadata(self, metadata: Any) -> None:
+        required_attrs = (
+            "page_table",
+            "cache_seqlens_int32",
+            "cu_seqlens_k",
+        )
+        if metadata is None or not all(
+            hasattr(metadata, attr) for attr in required_attrs
+        ):
+            self._original_metadata = None
+            return
+
         self._original_metadata = {
-            "page_table": metadata.page_table.clone(),
             "cache_seqlens_int32": metadata.cache_seqlens_int32.clone(),
-            "cu_seqlens_k": metadata.cu_seqlens_k.clone(),
             "max_seq_len_k": metadata.max_seq_len_k,
         }
 
@@ -110,13 +119,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
         if self._original_metadata is None:
             return current_metadata
 
-        if not sparse_mask.any():
-            return current_metadata
-
-        current_metadata.page_table.copy_(self._original_metadata["page_table"])
-        current_metadata.cache_seqlens_int32.copy_(
-            self._original_metadata["cache_seqlens_int32"]
-        )
+        sparse_mask = sparse_mask & (valid_lengths > 0)
 
         physical_pages = self._logical_to_physical_pages_batch(
             selected_indices,
@@ -131,26 +134,37 @@ class FlashAttentionAdaptor(BackendAdaptor):
         ) < valid_lengths.unsqueeze(1)
         update_mask = sparse_mask.unsqueeze(1) & valid_mask
 
-        current_metadata.page_table[:, :max_selected] = torch.where(
-            update_mask, physical_pages, current_metadata.page_table[:, :max_selected]
-        )
+        page_table = current_metadata.page_table[:, :max_selected]
+        page_table.copy_(torch.where(update_mask, physical_pages, page_table))
 
         seq_lens = forward_batch.seq_lens
         positions_in_page = (seq_lens - 1) % page_size
         diff = page_size - positions_in_page - 1
         sparse_seq_lens = (valid_lengths * page_size - diff).to(torch.int32)
 
-        current_metadata.cache_seqlens_int32 = torch.where(
-            sparse_mask, sparse_seq_lens, self._original_metadata["cache_seqlens_int32"]
+        current_metadata.cache_seqlens_int32.copy_(
+            torch.where(
+                sparse_mask,
+                sparse_seq_lens,
+                self._original_metadata["cache_seqlens_int32"],
+            )
         )
 
-        current_metadata.cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(
-                current_metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-            ),
-            (1, 0),
+        current_metadata.cu_seqlens_k[0].zero_()
+        current_metadata.cu_seqlens_k[1:].copy_(
+            torch.cumsum(current_metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
         )
-        current_metadata.max_seq_len_k = int(current_metadata.cache_seqlens_int32.max())
+        # scheduler_metadata is disabled for runtime sparse attention, so this
+        # field only needs to remain a safe upper bound. Preserve the dense-row
+        # bound for mixed batches without adding a GPU-to-CPU synchronization.
+        current_metadata.max_seq_len_k = max(
+            self._original_metadata["max_seq_len_k"], max_selected * page_size
+        )
+        # FA3 scheduler metadata is precomputed from the dense decode metadata.
+        # Once Quest rewrites page_table/cache_seqlens, that tensor can have the
+        # wrong shape for the sparse max_seq_len_k and the kernel will reject it.
+        if hasattr(current_metadata, "scheduler_metadata"):
+            current_metadata.scheduler_metadata = None
         return current_metadata
 
     def _logical_to_physical_pages_batch(

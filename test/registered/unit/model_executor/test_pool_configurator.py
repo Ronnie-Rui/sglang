@@ -62,6 +62,7 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    enable_runtime_sparse_attention=False,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -76,6 +77,7 @@ def _make_model_runner(
     mr.mambaish_config = mambaish_config
     mr.is_hybrid_swa = is_hybrid_swa
     mr.sliding_window_size = sliding_window_size
+    mr.enable_runtime_sparse_attention = enable_runtime_sparse_attention
 
     mc = SimpleNamespace()
     mc.head_dim = head_dim
@@ -115,6 +117,9 @@ def _make_model_runner(
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_dsa_cache_layer_split = False
+    sa.hisparse_config = (
+        '{"algorithm":"quest"}' if enable_runtime_sparse_attention else None
+    )
     mr.server_args = sa
 
     spec = MagicMock()
@@ -200,6 +205,34 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+    def test_runtime_quest_representation_memory_is_budgeted(self):
+        available = 10_000_000
+        page_size = 16
+        mr, _, config = self._run(
+            available,
+            page_size=page_size,
+            enable_runtime_sparse_attention=True,
+        )
+
+        kv_bytes_per_token = _actual_memory_used(
+            mr,
+            SimpleNamespace(max_total_num_tokens=1),
+        )
+        representation_bytes_per_page = mr.num_effective_layers * (
+            2 * mr.model_config.get_num_kv_heads(1) * mr.model_config.head_dim * 4 + 1
+        )
+        num_representation_pages = config.max_total_num_tokens // page_size + 1
+        used = (
+            config.max_total_num_tokens * kv_bytes_per_token
+            + num_representation_pages * representation_bytes_per_page
+        )
+
+        expected_pages = (available - representation_bytes_per_page) // (
+            page_size * kv_bytes_per_token + representation_bytes_per_page
+        )
+        self.assertEqual(config.max_total_num_tokens, expected_pages * page_size)
+        self.assertLessEqual(used, available)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):

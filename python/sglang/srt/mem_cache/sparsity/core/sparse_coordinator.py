@@ -243,11 +243,13 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[torch.Tensor]:
         req_pool_indices = forward_batch.req_pool_indices
+        layer_id = layer.layer_id
+
         # Compute Topk
         sparse_mask = self._compute_sparse_mask(req_pool_indices)
         selected_indices, valid_lengths = self.algorithm.retrieve_topk(
             queries=query,
-            layer_id=layer.layer_id,
+            layer_id=layer_id,
             req_pool_indices=req_pool_indices,
             sparse_mask=sparse_mask,
             forward_batch=forward_batch,
@@ -268,9 +270,9 @@ class SparseCoordinator:
         )
 
     def _compute_sparse_mask(self, req_pool_indices):
-        mask = (
-            self.states.prompt_lens[req_pool_indices]
-            >= self.config.min_sparse_prompt_len
+        min_sparse_prompt_len = self.config.min_sparse_prompt_len or 0
+        mask = self.states.repr_constructed[req_pool_indices] & (
+            self.states.prompt_lens[req_pool_indices] >= min_sparse_prompt_len
         )
 
         return mask

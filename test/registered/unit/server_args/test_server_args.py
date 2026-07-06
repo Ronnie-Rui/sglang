@@ -11,6 +11,7 @@ import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
+from sglang.srt.mem_cache.sparsity import parse_runtime_sparse_config
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -159,6 +160,48 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
+    def _prepare_quest_runtime_args(self, model_config_overrides=None, **overrides):
+        from sglang.srt.arg_groups.hisparse_hook import (
+            apply_runtime_sparse_cuda_graph_defaults,
+            validate_hisparse,
+        )
+        from sglang.srt.arg_groups.overrides import (
+            materialize_declarations,
+            resolved_view,
+        )
+        from sglang.srt.configs.model_config import AttentionArch
+
+        kwargs = dict(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            hisparse_config='{"algorithm":"quest","backend":"fa3","page_size":16}',
+        )
+        kwargs.update(overrides)
+        server_args = ServerArgs(**kwargs)
+        # The dummy model path intentionally exits __post_init__ early. Run the
+        # config phases covered by Quest runtime tests without loading a model.
+        server_args.model_config = MagicMock()
+        server_args.model_config.hf_config.dual_chunk_attention_config = None
+        server_args.model_config.hf_text_config.num_kv_shared_layers = 0
+        server_args.model_config.attention_arch = AttentionArch.MHA
+        server_args.model_config.is_encoder_decoder = False
+        server_args.model_config.is_multimodal = False
+        server_args.model_config.is_generation = True
+        server_args.model_config.is_hybrid_swa = False
+        server_args.model_config.sliding_window_size = None
+        server_args.model_config.attention_chunk_size = None
+        for name, value in (model_config_overrides or {}).items():
+            setattr(server_args.model_config, name, value)
+        server_args._handle_cuda_graph_config()
+        with patch.object(ServerArgs, "use_mla_backend", return_value=False):
+            server_args._handle_attention_backend_compatibility()
+        server_args._handle_page_size()
+        validate_hisparse(resolved_view(server_args))
+        apply_runtime_sparse_cuda_graph_defaults(server_args)
+        materialize_declarations(server_args)
+        return server_args
+
     # The backend selection moved to the resolution pipeline; these policy
     # tests drive the pass through its read-only view.
     @staticmethod
@@ -176,6 +219,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             dsa_prefill_backend=None,
             dsa_decode_backend=None,
             enable_hisparse=True,
+            hisparse_config=None,
         )
         defaults.update(kw)
         view = ResolvedView(
@@ -228,6 +272,162 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
         self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_quest_runtime_skips_dsa_backend_defaults(self, _mock_is_hip):
+        resolved = self._resolve(
+            "bfloat16",
+            hisparse_config='{"algorithm":"quest","backend":"fa3","page_size":16}',
+        )
+
+        self.assertIsNone(resolved["dsa_prefill_backend"])
+        self.assertIsNone(resolved["dsa_decode_backend"])
+
+    def test_quest_runtime_uses_hisparse_entrypoint_and_breakable_decode_graph(self):
+        server_args = self._prepare_quest_runtime_args()
+
+        self.assertEqual(server_args.attention_backend, "fa3")
+        self.assertEqual(server_args.page_size, 16)
+        self.assertEqual(
+            server_args.cuda_graph_config.decode.backend, Backend.BREAKABLE
+        )
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
+
+    def test_quest_runtime_requires_disable_radix_cache(self):
+        with self.assertRaisesRegex(ValueError, "--disable-radix-cache"):
+            self._prepare_quest_runtime_args(disable_radix_cache=False)
+
+    def test_quest_runtime_rejects_prefill_cuda_graph_when_user_requested(self):
+        with self.assertRaisesRegex(ValueError, "prefill CUDA graph"):
+            self._prepare_quest_runtime_args(cuda_graph_backend_prefill="breakable")
+
+    def test_quest_runtime_rejects_invalid_hisparse_config_json(self):
+        with self.assertRaisesRegex(ValueError, "Failed to parse hisparse_config"):
+            self._prepare_quest_runtime_args(hisparse_config='{"algorithm":"quest"')
+
+    def test_quest_runtime_rejects_unsupported_backend(self):
+        with self.assertRaisesRegex(ValueError, "supports backend values"):
+            self._prepare_quest_runtime_args(
+                hisparse_config=(
+                    '{"algorithm":"quest","backend":"flashinfer","page_size":16}'
+                )
+            )
+
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
+    def test_quest_runtime_rejects_rocm(self, _mock_is_hip):
+        with self.assertRaisesRegex(ValueError, "does not yet support ROCm"):
+            self._prepare_quest_runtime_args()
+
+    def test_quest_runtime_rejects_page_size_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "must match.*--page-size"):
+            self._prepare_quest_runtime_args(page_size=8)
+
+    def test_quest_runtime_rejects_speculative_decoding(self):
+        with self.assertRaisesRegex(ValueError, "speculative decoding"):
+            self._prepare_quest_runtime_args(speculative_algorithm="EAGLE")
+
+    def test_quest_runtime_rejects_diffusion_llm(self):
+        with self.assertRaisesRegex(ValueError, "diffusion LLM"):
+            self._prepare_quest_runtime_args(dllm_algorithm="dream")
+
+    def test_quest_runtime_rejects_pdmux(self):
+        with self.assertRaisesRegex(ValueError, "PD multiplexing"):
+            self._prepare_quest_runtime_args(enable_pdmux=True)
+
+    def test_quest_runtime_rejects_pd_disaggregation(self):
+        with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+            self._prepare_quest_runtime_args(disaggregation_mode="decode")
+
+    def test_quest_runtime_rejects_two_batch_overlap(self):
+        with self.assertRaisesRegex(ValueError, "two-batch overlap"):
+            self._prepare_quest_runtime_args(enable_two_batch_overlap=True)
+
+    def test_quest_runtime_rejects_mixed_chunk(self):
+        with self.assertRaisesRegex(ValueError, "mixed chunked prefill"):
+            self._prepare_quest_runtime_args(enable_mixed_chunk=True)
+
+    def test_quest_runtime_rejects_dp_attention(self):
+        with self.assertRaisesRegex(ValueError, "DP attention"):
+            self._prepare_quest_runtime_args(enable_dp_attention=True)
+
+    def test_quest_runtime_rejects_context_parallelism(self):
+        cases = (
+            ({"enable_prefill_cp": True}, "prefill context parallelism"),
+            ({"attn_cp_size": 2}, "attention context parallelism"),
+            ({"dcp_size": 2}, "decode context parallelism"),
+        )
+        for overrides, message in cases:
+            with self.subTest(**overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._prepare_quest_runtime_args(**overrides)
+
+    def test_quest_runtime_rejects_mla(self):
+        from sglang.srt.configs.model_config import AttentionArch
+
+        with self.assertRaisesRegex(ValueError, "MHA/GQA"):
+            self._prepare_quest_runtime_args(
+                model_config_overrides={"attention_arch": AttentionArch.MLA}
+            )
+
+    def test_quest_runtime_rejects_sliding_window_attention(self):
+        with self.assertRaisesRegex(ValueError, "sliding-window"):
+            self._prepare_quest_runtime_args(
+                model_config_overrides={"sliding_window_size": 4096}
+            )
+
+    def test_quest_runtime_rejects_hybrid_linear_attention(self):
+        from sglang.srt.configs import Qwen3NextConfig
+
+        with self.assertRaisesRegex(ValueError, "hybrid linear-attention"):
+            self._prepare_quest_runtime_args(
+                model_config_overrides={"hf_config": Qwen3NextConfig()}
+            )
+
+    def test_quest_runtime_rejects_multimodal_models(self):
+        with self.assertRaisesRegex(ValueError, "multimodal models"):
+            self._prepare_quest_runtime_args(
+                model_config_overrides={"is_multimodal": True}
+            )
+
+    def test_quest_runtime_rejects_non_generation_models(self):
+        with self.assertRaisesRegex(ValueError, "only supported for generation"):
+            self._prepare_quest_runtime_args(
+                model_config_overrides={"is_generation": False}
+            )
+
+    def test_quest_runtime_rejects_invalid_sparsity_ratio(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            attention_backend="fa3",
+            page_size=16,
+            hisparse_config=(
+                '{"algorithm":"quest","backend":"fa3","page_size":16,'
+                '"sparsity_ratio":1.2}'
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "sparsity_ratio"):
+            parse_runtime_sparse_config(server_args)
+
+    def test_quest_runtime_rejects_invalid_num_recent_pages(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            attention_backend="fa3",
+            page_size=16,
+            hisparse_config=(
+                '{"algorithm":"quest","backend":"fa3","page_size":16,'
+                '"num_recent_pages":0}'
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "num_recent_pages"):
+            parse_runtime_sparse_config(server_args)
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
