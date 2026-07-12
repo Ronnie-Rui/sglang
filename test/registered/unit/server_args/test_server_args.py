@@ -429,6 +429,41 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "num_recent_pages"):
             parse_runtime_sparse_config(server_args)
 
+    def test_quest_runtime_rejects_non_boolean_triton_score_kernel(self):
+        for invalid_value in ('"false"', "null", "0"):
+            with self.subTest(invalid_value=invalid_value):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=(
+                        '{"algorithm":"quest","backend":"fa3","page_size":16,'
+                        f'"use_triton_score_kernel":{invalid_value}}}'
+                    ),
+                )
+
+                with self.assertRaisesRegex(ValueError, "use_triton_score_kernel"):
+                    parse_runtime_sparse_config(server_args)
+
+    def test_quest_runtime_accepts_disabled_triton_score_kernel(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            attention_backend="fa3",
+            page_size=16,
+            hisparse_config=(
+                '{"algorithm":"quest","backend":"fa3","page_size":16,'
+                '"use_triton_score_kernel":false}'
+            ),
+        )
+
+        config = parse_runtime_sparse_config(server_args)
+
+        self.assertIs(config.sparse_extra_config["use_triton_score_kernel"], False)
+
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
         server_args = ServerArgs(

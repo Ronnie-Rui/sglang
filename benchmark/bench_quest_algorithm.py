@@ -37,7 +37,7 @@ def ensure_package(name: str) -> None:
     if name in sys.modules:
         return
     module = types.ModuleType(name)
-    module.__path__ = []
+    module.__path__ = [os.path.join(REPO_ROOT, "python", *name.split("."))]
     sys.modules[name] = module
 
 
@@ -83,12 +83,14 @@ class BenchSparseConfig:
     page_size: int
     sparsity_ratio: float
     num_recent_pages: int
+    use_triton_score_kernel: bool
 
     @property
     def sparse_extra_config(self) -> dict:
         return {
             "sparsity_ratio": self.sparsity_ratio,
             "num_recent_pages": self.num_recent_pages,
+            "use_triton_score_kernel": self.use_triton_score_kernel,
         }
 
 
@@ -102,6 +104,7 @@ class BenchCase:
     head_dim: int
     sparsity_ratio: float
     num_recent_pages: int
+    use_triton_score_kernel: bool
 
     @property
     def num_pages(self) -> int:
@@ -216,6 +219,7 @@ def prepare_case(
         page_size=case.page_size,
         sparsity_ratio=case.sparsity_ratio,
         num_recent_pages=case.num_recent_pages,
+        use_triton_score_kernel=case.use_triton_score_kernel,
     )
     algorithm = QuestAlgorithm(config, device)
     algorithm.initialize_representation_pool(
@@ -332,22 +336,31 @@ def run_stage_once(
     selected_pages_mean = 0.0
 
     if stage == "compute_page_reps":
-        fn = lambda: compute_page_representations(prepared)
+
+        def fn():
+            return compute_page_representations(prepared)
+
     elif stage == "retrieve_scores":
-        fn = lambda: prepared.algorithm._retrieve_page_scores(
-            0,
-            prepared.phys_pages,
-            prepared.req_pool_indices,
-            prepared.queries,
-        )
+
+        def fn():
+            return prepared.algorithm._retrieve_page_scores(
+                0,
+                prepared.phys_pages,
+                prepared.req_pool_indices,
+                prepared.queries,
+            )
+
     elif stage == "retrieve_topk":
-        fn = lambda: prepared.algorithm.retrieve_topk(
-            prepared.queries,
-            0,
-            prepared.req_pool_indices,
-            prepared.sparse_mask,
-            forward_batch=prepared.forward_batch,
-        )
+
+        def fn():
+            return prepared.algorithm.retrieve_topk(
+                prepared.queries,
+                0,
+                prepared.req_pool_indices,
+                prepared.sparse_mask,
+                forward_batch=prepared.forward_batch,
+            )
+
     else:
         raise ValueError(f"Unknown stage: {stage}")
 
@@ -381,6 +394,7 @@ def run_stage_once(
         "head_dim": case.head_dim,
         "sparsity_ratio": case.sparsity_ratio,
         "recent_pages": case.num_recent_pages,
+        "score_kernel": "triton" if case.use_triton_score_kernel else "torch",
         "dtype": str(dtype).replace("torch.", ""),
         "device": str(device),
         "warmup": warmup,
@@ -472,6 +486,7 @@ def iter_cases(args: argparse.Namespace) -> list[BenchCase]:
             head_dim=args.head_dim,
             sparsity_ratio=sparsity_ratio,
             num_recent_pages=args.num_recent_pages,
+            use_triton_score_kernel=args.score_kernel == "triton",
         )
         for batch_size in args.batch_sizes
         for seq_len in args.seq_lens
@@ -570,6 +585,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-heads", type=int, default=32)
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument(
+        "--score-kernel",
+        choices=["triton", "torch"],
+        default="triton",
+        help="Quest page-score implementation used by CUDA benchmark cases.",
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument(

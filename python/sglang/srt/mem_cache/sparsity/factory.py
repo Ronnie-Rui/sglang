@@ -192,6 +192,14 @@ def parse_runtime_sparse_config(server_args) -> SparseConfig:
             "Sparse runtime config num_recent_pages must be a positive integer, "
             f"got {num_recent_pages!r}."
         )
+    use_triton_score_kernel = config.sparse_extra_config.get("use_triton_score_kernel")
+    if "use_triton_score_kernel" in config.sparse_extra_config and not isinstance(
+        use_triton_score_kernel, bool
+    ):
+        raise ValueError(
+            "Sparse runtime config use_triton_score_kernel must be a boolean, "
+            f"got {use_triton_score_kernel!r}."
+        )
     return config
 
 

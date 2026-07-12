@@ -336,6 +336,7 @@ class TestFlashAttentionAdaptor(unittest.TestCase):
 class TestQuestScoring(unittest.TestCase):
     def test_gqa_heads_are_scored_without_sign_cancellation(self):
         algorithm = QuestAlgorithm.__new__(QuestAlgorithm)
+        algorithm.use_triton_score_kernel = False
         algorithm.page_k_min = {
             0: torch.tensor([[[-10.0]], [[0.0]]], dtype=torch.float32)
         }

@@ -23,6 +23,9 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
 
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
+        self.use_triton_score_kernel = config.sparse_extra_config.get(
+            "use_triton_score_kernel", True
+        )
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
@@ -133,6 +136,24 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         # Clamp pages to valid storage range
         phys_pages_clamped = phys_pages.clamp(0, self.page_k_min[layer_id].shape[0] - 1)
 
+        if (
+            self.use_triton_score_kernel
+            and queries.is_cuda
+            and torch.version.hip is None
+            and self.page_k_min[layer_id].shape[-1] <= 256
+        ):
+            from sglang.srt.mem_cache.sparsity.kernels.quest_score import (
+                quest_page_scores,
+            )
+
+            return quest_page_scores(
+                queries,
+                self.page_k_min[layer_id],
+                self.page_k_max[layer_id],
+                self.page_valid[layer_id],
+                phys_pages_clamped,
+            )
+
         k_min = self.page_k_min[layer_id][phys_pages_clamped]
         k_max = self.page_k_max[layer_id][phys_pages_clamped]
         valid_mask = self.page_valid[layer_id][phys_pages_clamped]
@@ -145,7 +166,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                     f"Quest query hidden size {hidden} not divisible by head_dim {head_dim}"
                 )
             q_heads = hidden // head_dim
-            q = queries.view(bs, q_heads, head_dim)
+            q = queries.reshape(bs, q_heads, head_dim)
         elif queries.dim() == 3:
             q = queries
         else:
