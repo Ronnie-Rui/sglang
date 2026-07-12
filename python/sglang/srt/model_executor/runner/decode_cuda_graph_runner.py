@@ -385,11 +385,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
+    def _runtime_sparse_coordinator(self):
+        return getattr(self.model_runner, "runtime_sparse_coordinator", None)
+
+    def _sparse_graph_page_capacities(self):
+        coordinator = self._runtime_sparse_coordinator()
+        if coordinator is None or not coordinator.enable_cuda_graph_retrieval:
+            return (None,)
+        return coordinator.cuda_graph_page_buckets
+
+    def _select_sparse_graph_page_capacity(self, forward_batch: ForwardBatch):
+        coordinator = self._runtime_sparse_coordinator()
+        if coordinator is None or not coordinator.enable_cuda_graph_retrieval:
+            return None
+        return coordinator.select_cuda_graph_page_capacity(forward_batch.seq_lens_cpu)
+
+    def _make_graph_key(
+        self,
+        bs,
+        stream_idx=None,
+        variant_label=None,
+        sparse_page_capacity=None,
+    ):
         return ShapeKey(
             size=bs,
             stream_idx=stream_idx,
             variant_label=variant_label,
+            sparse_page_capacity=sparse_page_capacity,
         )
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
@@ -416,9 +438,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+        sparse_page_capacity = self._select_sparse_graph_page_capacity(forward_batch)
+        coordinator = self._runtime_sparse_coordinator()
+        is_sparse_capacity_supported = not (
+            coordinator is not None
+            and coordinator.enable_cuda_graph_retrieval
+            and sparse_page_capacity is None
+        )
+        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        graph_key = self._make_graph_key(
+            cuda_graph_bs,
+            stream_idx,
+            self._resolve_lora_variant(forward_batch),
+            sparse_page_capacity,
+        )
 
         is_bs_supported = (
             self.backend.can_run(forward_batch, graph_key)
@@ -466,6 +499,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return (
             is_bs_supported
+            and is_sparse_capacity_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
@@ -510,6 +544,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self,
         size: int,
         stream_idx: Optional[int] = None,
+        sparse_page_capacity: Optional[int] = None,
     ):
         """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
@@ -647,6 +682,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
+        forward_batch.runtime_sparse_page_capacity = sparse_page_capacity
 
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.
@@ -715,18 +751,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.gpu_id,
             empty_cache=False,
         )
-        # Reverse so cuda graphs share memory better.
+        # Reverse so cuda graphs share memory better. Runtime sparse attention
+        # also captures a small set of context buckets so short requests do not
+        # pay the max-context score/top-k width on every layer.
+        capture_shapes = [
+            (bs, sparse_page_capacity)
+            for bs in self.capture_bs
+            for sparse_page_capacity in self._sparse_graph_page_capacities()
+        ]
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
+            tqdm.tqdm(list(reversed(capture_shapes)))
             if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
+            else reversed(capture_shapes)
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
-        for bs in capture_range:
+        for bs, sparse_page_capacity in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
@@ -734,7 +777,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    "Capturing batches "
+                    f"({bs=} pages={sparse_page_capacity} {avail_mem=:.2f} GB)"
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
@@ -745,7 +789,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    self.capture_one_shape(
+                        bs,
+                        forward,
+                        stream_idx,
+                        variant_label,
+                        sparse_page_capacity,
+                    )
 
     def capture_one_shape(
         self,
@@ -753,6 +803,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        sparse_page_capacity: Optional[int] = None,
     ):
         bs = size
         num_tokens = bs * self.num_tokens_per_bs
@@ -764,7 +815,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            size, stream_idx=stream_idx
+            size,
+            stream_idx=stream_idx,
+            sparse_page_capacity=sparse_page_capacity,
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
@@ -840,7 +893,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
-                shape_key = self._make_graph_key(bs, stream_idx, variant_label)
+                shape_key = self._make_graph_key(
+                    bs,
+                    stream_idx,
+                    variant_label,
+                    sparse_page_capacity,
+                )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -914,8 +972,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+            sparse_page_capacity = self._select_sparse_graph_page_capacity(
+                forward_batch
+            )
             self._replay_graph_key = self._make_graph_key(
-                self.bs, stream_idx, variant_label
+                self.bs,
+                stream_idx,
+                variant_label,
+                sparse_page_capacity,
             )
             return
 
@@ -990,8 +1054,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        sparse_page_capacity = self._select_sparse_graph_page_capacity(forward_batch)
         self._replay_graph_key = self._make_graph_key(
-            self.bs, stream_idx, variant_label
+            self.bs,
+            stream_idx,
+            variant_label,
+            sparse_page_capacity,
         )
 
     def execute(

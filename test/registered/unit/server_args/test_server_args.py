@@ -464,6 +464,44 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         self.assertIs(config.sparse_extra_config["use_triton_score_kernel"], False)
 
+    def test_quest_runtime_rejects_invalid_cuda_graph_context_buckets(self):
+        for invalid_value in ("[]", "[8192,0]", '"8192"'):
+            with self.subTest(invalid_value=invalid_value):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=(
+                        '{"algorithm":"quest","backend":"fa3","page_size":16,'
+                        f'"cuda_graph_context_buckets":{invalid_value}}}'
+                    ),
+                )
+
+                with self.assertRaisesRegex(ValueError, "cuda_graph_context_buckets"):
+                    parse_runtime_sparse_config(server_args)
+
+    def test_quest_runtime_accepts_cuda_graph_context_buckets(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            attention_backend="fa3",
+            page_size=16,
+            hisparse_config=(
+                '{"algorithm":"quest","backend":"fa3","page_size":16,'
+                '"cuda_graph_context_buckets":[10240,33792]}'
+            ),
+        )
+
+        config = parse_runtime_sparse_config(server_args)
+
+        self.assertEqual(
+            config.sparse_extra_config["cuda_graph_context_buckets"],
+            [10240, 33792],
+        )
+
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
         server_args = ServerArgs(

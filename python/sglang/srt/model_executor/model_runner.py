@@ -890,6 +890,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 server_args=self.server_args,
+                max_context_len=self.model_config.context_len,
             )
 
         self.init_routed_experts_capturer()

@@ -24,10 +24,12 @@ def _quest_page_score_kernel(
     physical_page_raw = tl.load(physical_pages_ptr + batch_idx * num_pages + page_idx)
     page_in_bounds = (physical_page_raw >= 0) & (physical_page_raw < num_pool_pages)
     physical_page = tl.where(page_in_bounds, physical_page_raw, 0)
-    page_is_valid = tl.load(page_valid_ptr + physical_page)
+    page_is_valid = tl.load(
+        page_valid_ptr + physical_page, mask=page_in_bounds, other=0
+    )
 
     dim_offsets = tl.arange(0, BLOCK_D)
-    dim_mask = dim_offsets < HEAD_DIM
+    dim_mask = (dim_offsets < HEAD_DIM) & page_in_bounds & page_is_valid
     best_bound = -float("inf")
 
     for kv_head in range(KV_HEADS):

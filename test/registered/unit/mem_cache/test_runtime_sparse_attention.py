@@ -333,6 +333,151 @@ class TestFlashAttentionAdaptor(unittest.TestCase):
         self.assertIsNone(metadata.scheduler_metadata)
 
 
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.version.hip is None,
+    "NVIDIA CUDA is required for the Quest metadata kernel",
+)
+class TestQuestFlashAttentionMetadataKernel(unittest.TestCase):
+    @staticmethod
+    def _make_inputs():
+        device = torch.device("cuda")
+        req_to_token = torch.tensor(
+            [
+                [0, 1, 2, 3, 12, 13, 14, 15, 24, 25, 26, 27],
+                [4, 5, 6, 7, 16, 17, 18, 19, 28, 29, 30, 31],
+                [8, 9, 10, 11, 20, 21, 22, 23, 32, 33, 34, 35],
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        return {
+            "selected_indices": torch.tensor(
+                [[2, 0], [1, -1], [0, -1]],
+                dtype=torch.int32,
+                device=device,
+            ),
+            "valid_lengths": torch.tensor([2, 1, 0], dtype=torch.int32, device=device),
+            "sparse_mask": torch.tensor(
+                [True, True, True], dtype=torch.bool, device=device
+            ),
+            "seq_lens": torch.tensor([10, 7, 3], dtype=torch.int64, device=device),
+            "req_pool_indices": torch.tensor(
+                [0, 1, 2], dtype=torch.int64, device=device
+            ),
+            "req_to_token": req_to_token,
+            "page_table": torch.tensor(
+                [[10, 11, 12], [20, 21, 22], [30, 31, 32]],
+                dtype=torch.int32,
+                device=device,
+            ),
+            "cache_seqlens_int32": torch.tensor(
+                [10, 7, 3], dtype=torch.int32, device=device
+            ),
+            "cu_seqlens_k": torch.tensor(
+                [0, 10, 17, 20], dtype=torch.int32, device=device
+            ),
+        }
+
+    @staticmethod
+    def _run_kernel(inputs, *, update_lengths):
+        from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
+            quest_update_flashattention_metadata_,
+        )
+
+        quest_update_flashattention_metadata_(
+            **inputs,
+            page_size=4,
+            update_lengths=update_lengths,
+        )
+
+    def test_updates_ragged_mixed_metadata_in_place(self):
+        inputs = self._make_inputs()
+        page_table_ptr = inputs["page_table"].data_ptr()
+        cache_seqlens_ptr = inputs["cache_seqlens_int32"].data_ptr()
+        cu_seqlens_ptr = inputs["cu_seqlens_k"].data_ptr()
+
+        self._run_kernel(inputs, update_lengths=True)
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            inputs["page_table"].cpu().tolist(),
+            [[6, 0, 12], [4, 21, 22], [30, 31, 32]],
+        )
+        self.assertEqual(inputs["cache_seqlens_int32"].cpu().tolist(), [6, 3, 3])
+        self.assertEqual(inputs["cu_seqlens_k"].cpu().tolist(), [0, 6, 9, 12])
+
+        inputs["selected_indices"].copy_(
+            torch.tensor([[1, 2], [0, -1], [2, -1]], device="cuda")
+        )
+        self._run_kernel(inputs, update_lengths=False)
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            inputs["page_table"].cpu().tolist(),
+            [[3, 6, 12], [1, 21, 22], [30, 31, 32]],
+        )
+        self.assertEqual(inputs["cache_seqlens_int32"].cpu().tolist(), [6, 3, 3])
+        self.assertEqual(inputs["cu_seqlens_k"].cpu().tolist(), [0, 6, 9, 12])
+        self.assertEqual(inputs["page_table"].data_ptr(), page_table_ptr)
+        self.assertEqual(inputs["cache_seqlens_int32"].data_ptr(), cache_seqlens_ptr)
+        self.assertEqual(inputs["cu_seqlens_k"].data_ptr(), cu_seqlens_ptr)
+
+    def test_cuda_graph_replays_with_new_values_and_stable_addresses(self):
+        inputs = self._make_inputs()
+        self._run_kernel(inputs, update_lengths=True)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._run_kernel(inputs, update_lengths=True)
+
+        page_table_ptr = inputs["page_table"].data_ptr()
+        cache_seqlens_ptr = inputs["cache_seqlens_int32"].data_ptr()
+        cu_seqlens_ptr = inputs["cu_seqlens_k"].data_ptr()
+        dense_page_table = torch.tensor(
+            [[10, 11, 12], [20, 21, 22], [30, 31, 32]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        inputs["selected_indices"].copy_(
+            torch.tensor([[1, 2], [2, -1], [0, -1]], device="cuda")
+        )
+        inputs["valid_lengths"].copy_(torch.tensor([2, 1, 0], device="cuda"))
+        inputs["sparse_mask"].copy_(torch.tensor([True, False, True], device="cuda"))
+        inputs["seq_lens"].copy_(torch.tensor([9, 6, 3], device="cuda"))
+        inputs["page_table"].copy_(dense_page_table)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            inputs["page_table"].cpu().tolist(),
+            [[3, 6, 12], [20, 21, 22], [30, 31, 32]],
+        )
+        self.assertEqual(inputs["cache_seqlens_int32"].cpu().tolist(), [5, 6, 3])
+        self.assertEqual(inputs["cu_seqlens_k"].cpu().tolist(), [0, 5, 11, 14])
+
+        inputs["selected_indices"].copy_(
+            torch.tensor([[0, 1], [0, -1], [1, -1]], device="cuda")
+        )
+        inputs["valid_lengths"].copy_(torch.tensor([2, 1, 1], device="cuda"))
+        inputs["sparse_mask"].copy_(torch.tensor([True, True, True], device="cuda"))
+        inputs["seq_lens"].copy_(torch.tensor([8, 5, 4], device="cuda"))
+        inputs["page_table"].copy_(dense_page_table)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            inputs["page_table"].cpu().tolist(),
+            [[0, 3, 12], [1, 21, 22], [5, 31, 32]],
+        )
+        self.assertEqual(inputs["cache_seqlens_int32"].cpu().tolist(), [8, 1, 4])
+        self.assertEqual(inputs["cu_seqlens_k"].cpu().tolist(), [0, 8, 9, 13])
+        self.assertEqual(inputs["page_table"].data_ptr(), page_table_ptr)
+        self.assertEqual(inputs["cache_seqlens_int32"].data_ptr(), cache_seqlens_ptr)
+        self.assertEqual(inputs["cu_seqlens_k"].data_ptr(), cu_seqlens_ptr)
+
+
 class TestQuestScoring(unittest.TestCase):
     def test_gqa_heads_are_scored_without_sign_cancellation(self):
         algorithm = QuestAlgorithm.__new__(QuestAlgorithm)

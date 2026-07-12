@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_CUDA_GRAPH_CONTEXT_BUCKETS = (10 * 1024, 33 * 1024)
+
 
 class RequestTrackers:
     """State tracker for sparse attention requests."""
@@ -104,6 +106,7 @@ class SparseCoordinator:
         start_layer: int,
         end_layer: int,
         device: torch.device,
+        max_context_len: Optional[int] = None,
     ):
         self.config = config
         self.algorithm = algorithm
@@ -114,6 +117,20 @@ class SparseCoordinator:
         self.end_layer = end_layer
         self.device = device
         self.page_size = config.page_size
+        self.cuda_graph_max_num_pages = (
+            (max_context_len + self.page_size - 1) // self.page_size
+            if max_context_len is not None
+            else max(self.req_to_token_pool.max_context_len // self.page_size, 1)
+        )
+        self.algorithm.cuda_graph_max_num_pages = self.cuda_graph_max_num_pages
+        self.enable_cuda_graph_retrieval = bool(
+            getattr(algorithm, "enable_cuda_graph_retrieval", False)
+            and config.backend in ("fa3", "flashattention")
+            and torch.device(device).type == "cuda"
+            and torch.version.hip is None
+            and max_context_len is not None
+        )
+        self.cuda_graph_page_buckets = self._build_cuda_graph_page_buckets()
 
         self.states = RequestTrackers(
             req_to_token_pool.req_to_token.shape[0],
@@ -135,6 +152,56 @@ class SparseCoordinator:
 
         logger.info(
             f"SparseCoordinator initialized with sparse algorithm={type(algorithm).__name__}"
+        )
+        if self.cuda_graph_page_buckets:
+            logger.info(
+                "Runtime sparse CUDA graph page buckets: %s",
+                self.cuda_graph_page_buckets,
+            )
+
+    def _build_cuda_graph_page_buckets(self) -> tuple[int, ...]:
+        if not self.enable_cuda_graph_retrieval:
+            return ()
+
+        max_pages = self.cuda_graph_max_num_pages
+        context_buckets = self.config.sparse_extra_config.get(
+            "cuda_graph_context_buckets",
+            _DEFAULT_CUDA_GRAPH_CONTEXT_BUCKETS,
+        )
+        page_buckets = {
+            min((context_len + self.page_size - 1) // self.page_size, max_pages)
+            for context_len in context_buckets
+            if context_len > 0
+        }
+        page_buckets.add(max_pages)
+        return tuple(sorted(page_buckets))
+
+    def select_cuda_graph_page_capacity(self, seq_lens_cpu) -> Optional[int]:
+        """Choose a captured page bucket without synchronizing a device tensor."""
+        if not self.cuda_graph_page_buckets:
+            return None
+
+        if torch.is_tensor(seq_lens_cpu):
+            if seq_lens_cpu.device.type != "cpu":
+                return self.cuda_graph_page_buckets[-1]
+            if seq_lens_cpu.numel() == 0:
+                max_seq_len = 0
+            else:
+                max_seq_len = int(seq_lens_cpu.max().item())
+        else:
+            try:
+                max_seq_len = max((int(value) for value in seq_lens_cpu), default=0)
+            except TypeError:
+                return self.cuda_graph_page_buckets[-1]
+
+        required_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        return next(
+            (
+                capacity
+                for capacity in self.cuda_graph_page_buckets
+                if capacity >= required_pages
+            ),
+            None,
         )
 
     def on_request_begin(self, req: "Req") -> None:
@@ -159,7 +226,12 @@ class SparseCoordinator:
         # TODO: Implement request end handling
         # - Release host indices if any were allocated for offloading
 
-    def forward_begin(self, forward_batch: "ForwardBatch") -> None:
+    def forward_begin(
+        self,
+        forward_batch: "ForwardBatch",
+        *,
+        fixed_capacity: bool | int = False,
+    ) -> None:
         """
         Handle forward pass begin event. Called before each forward pass starts.
 
@@ -177,6 +249,7 @@ class SparseCoordinator:
             req_pool_indices=req_pool_indices,
             sparse_mask=self._forward_sparse_mask,
             device=forward_batch.seq_lens.device,
+            fixed_capacity=fixed_capacity,
         )
 
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
@@ -217,6 +290,7 @@ class SparseCoordinator:
         layer: "RadixAttention",
         forward_batch: "ForwardBatch",
         attn_metadata: Optional[Any],
+        fixed_capacity: bool | int = False,
         **kwargs,
     ) -> Optional[Any]:
         """
@@ -226,7 +300,7 @@ class SparseCoordinator:
         and adapt attention metadata for the attention backend.
         """
         if layer.layer_id == self.start_layer:
-            self.forward_begin(forward_batch)
+            self.forward_begin(forward_batch, fixed_capacity=fixed_capacity)
             self.backend_adaptor.save_original_metadata(attn_metadata)
 
         return self._handle_sparse_retrieve(
@@ -288,8 +362,10 @@ class SparseCoordinator:
             attn_metadata=attn_metadata,
             **kwargs,
         )
-        selected_physical_indices = self.algorithm.get_selected_physical_pages(
-            selected_indices
+        selected_physical_indices = (
+            self.algorithm.get_selected_physical_pages(selected_indices)
+            if self.backend_adaptor.requires_selected_physical_indices
+            else None
         )
 
         # Adapt Attention Metadata

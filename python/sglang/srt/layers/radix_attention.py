@@ -301,12 +301,29 @@ def sparse_attention_forward(
     # attention metadata rewrites. Extend/prefill reaches this helper only to
     # let attention_end construct or update page representations after dense FA.
     if forward_batch.forward_mode.is_decode():
+        in_breakable_graph = is_in_breakable_cuda_graph()
+        capture_retrieval = in_breakable_graph and getattr(
+            runtime_sparse_coordinator, "enable_cuda_graph_retrieval", False
+        )
+        fixed_capacity = (
+            getattr(forward_batch, "runtime_sparse_page_capacity", True)
+            if capture_retrieval
+            else False
+        )
         attention_begin = (
             breakable_sparse_attention_begin
-            if is_in_breakable_cuda_graph()
+            if in_breakable_graph and not capture_retrieval
             else sparse_attention_begin
         )
-        attention_begin(q, k, v, layer, forward_batch, **kwargs)
+        attention_begin(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            fixed_capacity=fixed_capacity,
+            **kwargs,
+        )
 
     output = _dense_attention_forward(
         attn_backend, q, k, v, layer, forward_batch, save_kv_cache, **kwargs
@@ -351,6 +368,7 @@ def sparse_attention_begin(
     v: torch.Tensor,
     layer: RadixAttention,
     forward_batch: ForwardBatch,
+    fixed_capacity: bool | int = False,
     **kwargs,
 ) -> None:
     """Run query-dependent retrieval and rewrite FA metadata in place."""
@@ -370,6 +388,7 @@ def sparse_attention_begin(
         layer,
         forward_batch,
         current_metadata,
+        fixed_capacity=fixed_capacity,
         **kwargs,
     )
     if new_metadata is None:

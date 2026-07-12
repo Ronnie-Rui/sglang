@@ -411,6 +411,293 @@ class TestQuestRetrieveTopkEquivalence(CustomTestCase):
         )
         torch.testing.assert_close(physical_pages, expected)
 
+    def test_fixed_capacity_plan_uses_pool_bound_without_host_lengths(self):
+        capacity_lens = torch.tensor([32, 32], dtype=torch.int64, device=self.device)
+        algo, _ = _make_algorithm(
+            batch_size=2,
+            seq_lens=capacity_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+        )
+        forward_batch = _FakeForwardBatch(
+            torch.tensor([9, 5], dtype=torch.int64, device=self.device)
+        )
+        req_pool_indices = torch.arange(2, device=self.device)
+        sparse_mask = torch.ones(2, dtype=torch.bool, device=self.device)
+
+        with patch.object(
+            algo,
+            "_get_seq_lens_cpu",
+            side_effect=AssertionError("fixed plans must not read host lengths"),
+        ):
+            algo.begin_forward(
+                forward_batch,
+                req_pool_indices,
+                sparse_mask,
+                self.device,
+                fixed_capacity=16,
+            )
+
+        plan = algo._retrieval_plan
+        self.assertTrue(plan.fixed_capacity)
+        self.assertIsNone(plan.seq_lens_cpu)
+        self.assertIsNone(plan.num_pages_cpu)
+        self.assertEqual(plan.max_num_pages, 16)
+        self.assertEqual(plan.max_k, 7)
+        self.assertEqual(plan.page_idx.shape, (16,))
+        self.assertEqual(plan.physical_pages.shape, (2, 16))
+        self.assertEqual(plan.num_pages.tolist(), [9, 5])
+
+    def test_fixed_capacity_batch_one_uses_masked_batched_retrieval(self):
+        seq_lens = torch.tensor([16], dtype=torch.int64, device=self.device)
+        algo, _ = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+        )
+        forward_batch = _FakeForwardBatch(seq_lens)
+        req_pool_indices = torch.zeros(1, dtype=torch.long, device=self.device)
+        sparse_mask = torch.ones(1, dtype=torch.bool, device=self.device)
+        algo.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            self.device,
+            fixed_capacity=True,
+        )
+
+        with (
+            patch.object(
+                algo,
+                "_retrieve_topk_single",
+                side_effect=AssertionError("single-request dynamic path was used"),
+            ),
+            patch.object(
+                algo,
+                "_retrieve_topk_batched",
+                wraps=algo._retrieve_topk_batched,
+            ) as batched,
+        ):
+            algo.retrieve_topk(
+                torch.zeros((1, 1, 1), device=self.device),
+                0,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+            )
+        batched.assert_called_once()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestQuestFixedCapacityCudaGraph(unittest.TestCase):
+    @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
+    def test_triton_finalize_matches_torch_and_replays(self):
+        from sglang.srt.mem_cache.sparsity.kernels.quest_finalize import (
+            quest_finalize_selected_pages,
+        )
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        topk_scores = torch.tensor(
+            [
+                [9.0, 8.0, float("-inf"), 6.0, 5.0],
+                [4.0, float("nan"), 2.0, 1.0, float("inf")],
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        topk_indices = torch.tensor(
+            [[7, 2, 9, 1, 4], [8, 3, 6, 0, 5]],
+            dtype=torch.int64,
+            device=device,
+        )
+        k_per_req = torch.tensor([4, 5], dtype=torch.int64, device=device)
+        recent_indices = torch.tensor(
+            [[10, 11], [9, 10]], dtype=torch.int64, device=device
+        )
+        recent_valid = torch.tensor(
+            [[True, False], [True, True]], dtype=torch.bool, device=device
+        )
+
+        def run():
+            return quest_finalize_selected_pages(
+                topk_scores,
+                topk_indices,
+                k_per_req,
+                recent_indices,
+                recent_valid,
+            )
+
+        def reference():
+            topk_rank = torch.arange(topk_scores.shape[1], device=device)
+            topk_valid = (topk_rank < k_per_req.unsqueeze(1)) & torch.isfinite(
+                topk_scores
+            )
+            combined_idx = torch.cat([topk_indices, recent_indices], dim=1)
+            combined_valid = torch.cat([topk_valid, recent_valid], dim=1)
+            return QuestAlgorithm._finalize_selected_pages(
+                combined_idx, combined_valid, sentinel=32
+            )
+
+        expected_indices, expected_lengths = reference()
+        actual_indices, actual_lengths = run()
+        torch.testing.assert_close(actual_indices, expected_indices)
+        torch.testing.assert_close(actual_lengths, expected_lengths)
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_indices, captured_lengths = run()
+
+        topk_scores.copy_(
+            torch.tensor(
+                [[5.0, 4.0, 3.0, 2.0, 1.0], [9.0, 8.0, 7.0, 6.0, 5.0]],
+                device=device,
+            )
+        )
+        k_per_req.copy_(torch.tensor([2, 3], device=device))
+        recent_valid.copy_(torch.tensor([[True, True], [False, True]], device=device))
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected_indices, expected_lengths = reference()
+        torch.testing.assert_close(captured_indices, expected_indices)
+        torch.testing.assert_close(captured_lengths, expected_lengths)
+
+    def test_oversized_fixed_finalize_uses_torch_fallback(self):
+        from sglang.srt.mem_cache.sparsity.kernels.quest_finalize import (
+            QUEST_FINALIZE_MAX_WIDTH,
+        )
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        capacity = QUEST_FINALIZE_MAX_WIDTH + 1
+        capacity_lens = torch.tensor([capacity], dtype=torch.int64, device=device)
+        algo, _ = _make_algorithm(
+            batch_size=1,
+            seq_lens=capacity_lens,
+            page_size=1,
+            sparsity_ratio=1.0,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=device,
+            seed=0,
+        )
+        forward_batch = _FakeForwardBatch(capacity_lens)
+        req_pool_indices = torch.zeros(1, dtype=torch.long, device=device)
+        sparse_mask = torch.ones(1, dtype=torch.bool, device=device)
+        algo.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            device,
+            fixed_capacity=True,
+        )
+        plan = algo._retrieval_plan
+        topk_scores = torch.ones((1, plan.max_k), device=device)
+        topk_idx = torch.arange(plan.max_k, device=device).unsqueeze(0)
+
+        with patch(
+            "sglang.srt.mem_cache.sparsity.kernels.quest_finalize."
+            "quest_finalize_selected_pages",
+            side_effect=AssertionError("oversized input reached Triton finalize"),
+        ):
+            indices, lengths = algo._finalize_topk_with_recent(
+                topk_scores, topk_idx, plan
+            )
+
+        self.assertEqual(indices.shape, (1, capacity))
+        self.assertEqual(lengths.item(), capacity)
+        torch.testing.assert_close(
+            indices,
+            torch.arange(capacity, dtype=torch.int32, device=device).unsqueeze(0),
+        )
+
+    def test_replay_grows_from_inactive_capture_to_sparse_long_context(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        capacity_lens = torch.tensor([32], dtype=torch.int64, device=device)
+        algo, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=capacity_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=8,
+            device=device,
+            seed=7,
+        )
+        _populate_page_reps(algo, 1, capacity_lens, k_buffer, device)
+
+        seq_lens = torch.tensor([1], dtype=torch.int64, device=device)
+        forward_batch = _FakeForwardBatch(seq_lens)
+        req_pool_indices = torch.zeros(1, dtype=torch.long, device=device)
+        sparse_mask = torch.zeros(1, dtype=torch.bool, device=device)
+        queries = torch.zeros((1, 1, 8), dtype=torch.float32, device=device)
+
+        def run_fixed():
+            algo.begin_forward(
+                forward_batch,
+                req_pool_indices,
+                sparse_mask,
+                device,
+                fixed_capacity=True,
+            )
+            return algo.retrieve_topk(
+                queries,
+                0,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+            )
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                run_fixed()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_indices, captured_lengths = run_fixed()
+
+        seq_lens.copy_(torch.tensor([23], dtype=torch.int64, device=device))
+        sparse_mask.fill_(True)
+        queries.copy_(torch.randn_like(queries))
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected_indices, expected_lengths = _reference_retrieve_topk(
+            algo,
+            queries,
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch,
+        )
+        self.assertEqual(captured_lengths.cpu().tolist(), expected_lengths)
+        self.assertEqual(
+            _sorted_rows(captured_indices.cpu(), captured_lengths.cpu()),
+            _sorted_rows(expected_indices, expected_lengths),
+        )
+
 
 def _reference_compute_page_reps_masked(
     algo, layer_id, reqs, seq_lens, end_page, k_buffer

@@ -26,6 +26,9 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.use_triton_score_kernel = config.sparse_extra_config.get(
             "use_triton_score_kernel", True
         )
+        self.enable_cuda_graph_retrieval = config.sparse_extra_config.get(
+            "enable_cuda_graph_retrieval", True
+        )
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
@@ -133,7 +136,8 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         req_pool_indices: torch.Tensor,
         queries: torch.Tensor,
     ) -> torch.Tensor:
-        # Clamp pages to valid storage range
+        physical_pages = phys_pages
+        # Clamp pages to valid storage range for the portable torch fallback.
         phys_pages_clamped = phys_pages.clamp(0, self.page_k_min[layer_id].shape[0] - 1)
 
         if (
@@ -151,12 +155,15 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 self.page_k_min[layer_id],
                 self.page_k_max[layer_id],
                 self.page_valid[layer_id],
-                phys_pages_clamped,
+                physical_pages,
             )
 
         k_min = self.page_k_min[layer_id][phys_pages_clamped]
         k_max = self.page_k_max[layer_id][phys_pages_clamped]
-        valid_mask = self.page_valid[layer_id][phys_pages_clamped]
+        valid_mask = self.page_valid[layer_id][phys_pages_clamped] & (
+            (physical_pages >= 0)
+            & (physical_pages < self.page_k_min[layer_id].shape[0])
+        )
         # Align query shape to KV heads.
         head_dim = k_min.shape[-1]
         if queries.dim() == 2:

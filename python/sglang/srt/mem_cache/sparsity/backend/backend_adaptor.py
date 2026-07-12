@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 class BackendAdaptor(ABC):
     """Base class for attention backend adaptors."""
 
+    requires_selected_physical_indices = True
+
     def __init__(self, device: torch.device):
         self.device = device
         self._original_metadata = None
@@ -86,6 +88,8 @@ class DSABackendAdaptor(BackendAdaptor):
 class FlashAttentionAdaptor(BackendAdaptor):
     """Adaptor for FlashAttention backend."""
 
+    requires_selected_physical_indices = False
+
     def __init__(self, device: torch.device):
         super().__init__(device)
         self._metadata_prepared = False
@@ -147,6 +151,62 @@ class FlashAttentionAdaptor(BackendAdaptor):
         # TODO: Optimize performance
         """
         if self._original_metadata is None:
+            return current_metadata
+
+        max_selected = selected_indices.shape[1]
+        use_triton_metadata_kernel = (
+            selected_indices.is_cuda
+            and torch.version.hip is None
+            and valid_lengths.is_cuda
+            and sparse_mask.is_cuda
+            and forward_batch.seq_lens.is_cuda
+            and forward_batch.req_pool_indices.is_cuda
+            and req_to_token.is_cuda
+            and current_metadata.page_table.is_cuda
+            and current_metadata.cache_seqlens_int32.is_cuda
+            and current_metadata.cu_seqlens_k.is_cuda
+        )
+        if use_triton_metadata_kernel:
+            update_lengths = not self._metadata_prepared
+            if update_lengths:
+                self._max_selected = max_selected
+                # Keep the first layer's immutable result by reference. Cloning it
+                # would launch a GPU copy even when async assertions are disabled.
+                self._valid_lengths = valid_lengths
+            elif max_selected != self._max_selected:
+                raise ValueError(
+                    "Sparse selection width changed within one forward: "
+                    f"expected {self._max_selected}, got {max_selected}."
+                )
+            elif _ENABLE_ASYNC_ASSERT:
+                torch._assert_async(
+                    (valid_lengths == self._valid_lengths).all(),
+                    "Sparse valid lengths changed between layers in one forward.",
+                )
+
+            from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
+                quest_update_flashattention_metadata_,
+            )
+
+            quest_update_flashattention_metadata_(
+                selected_indices=selected_indices,
+                valid_lengths=valid_lengths,
+                sparse_mask=sparse_mask,
+                seq_lens=forward_batch.seq_lens,
+                req_pool_indices=forward_batch.req_pool_indices,
+                req_to_token=req_to_token,
+                page_table=current_metadata.page_table,
+                cache_seqlens_int32=current_metadata.cache_seqlens_int32,
+                cu_seqlens_k=current_metadata.cu_seqlens_k,
+                page_size=page_size,
+                update_lengths=update_lengths,
+            )
+            if update_lengths:
+                current_metadata.max_seq_len_k = max(
+                    self._original_metadata["max_seq_len_k"],
+                    max_selected * page_size,
+                )
+                self._metadata_prepared = True
             return current_metadata
 
         physical_pages = selected_physical_indices

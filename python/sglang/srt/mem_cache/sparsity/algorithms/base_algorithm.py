@@ -33,6 +33,7 @@ class _RetrievalPlan:
     score_order_required: bool
     recent_idx: torch.Tensor
     recent_valid: torch.Tensor
+    fixed_capacity: bool
 
 
 class BaseSparseAlgorithm(ABC):
@@ -63,6 +64,7 @@ class BaseSparseAlgorithm(ABC):
         req_pool_indices: torch.Tensor,
         sparse_mask: torch.Tensor,
         device: torch.device,
+        fixed_capacity: bool | int = False,
     ) -> None:
         """Prepare algorithm state shared by every layer in one forward."""
 
@@ -223,6 +225,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         req_pool_indices: torch.Tensor,
         sparse_mask: torch.Tensor,
         device: torch.device,
+        fixed_capacity: bool | int = False,
     ) -> None:
         """Cache decode metadata that is identical across attention layers."""
         self._representation_update_batch = forward_batch
@@ -237,6 +240,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             req_pool_indices,
             sparse_mask,
             device,
+            fixed_capacity=fixed_capacity,
         )
         self._representation_update_due = self._has_completed_page(
             self._retrieval_plan.seq_lens_cpu
@@ -430,7 +434,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             )
             self._retrieval_plan = plan
 
-        if bs == 1:
+        if bs == 1 and not plan.fixed_capacity:
             return self._retrieve_topk_single(
                 queries,
                 layer_id,
@@ -449,16 +453,35 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         req_pool_indices: torch.Tensor,
         sparse_mask: torch.Tensor,
         device: torch.device,
+        *,
+        fixed_capacity: bool | int = False,
     ) -> _RetrievalPlan:
         """Build the page layout and selection sizes once per forward."""
         bs = req_pool_indices.numel()
         seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.long)
-        seq_lens_cpu = self._get_seq_lens_cpu(forward_batch, bs)
+        seq_lens_cpu = (
+            None if fixed_capacity else self._get_seq_lens_cpu(forward_batch, bs)
+        )
         req_pool_indices = req_pool_indices.to(device=device, dtype=torch.long)
         sparse_mask = sparse_mask.to(device=device, dtype=torch.bool)
         num_pages = (seq_lens + self.page_size - 1) // self.page_size
 
-        if seq_lens_cpu is not None:
+        if fixed_capacity:
+            num_pages_cpu = None
+            max_context_len = self.req_to_token_pool.max_context_len
+            # ReqToTokenPool reserves a few decode/speculative slots beyond the
+            # model context, while FA page tables cover complete context pages.
+            pool_max_pages = getattr(
+                self,
+                "cuda_graph_max_num_pages",
+                max(max_context_len // self.page_size, 1),
+            )
+            max_num_pages = (
+                pool_max_pages
+                if isinstance(fixed_capacity, bool)
+                else min(fixed_capacity, pool_max_pages)
+            )
+        elif seq_lens_cpu is not None:
             num_pages_cpu = [
                 max((seq_len + self.page_size - 1) // self.page_size, 0)
                 for seq_len in seq_lens_cpu
@@ -482,6 +505,11 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
                 ].to(torch.long)
                 // self.page_size
             )
+            physical_pages = torch.where(
+                valid_page_mask,
+                physical_pages,
+                torch.full_like(physical_pages, -1),
+            )
         else:
             physical_pages = torch.empty((bs, 0), device=device, dtype=torch.long)
 
@@ -496,7 +524,18 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         k_per_req = torch.minimum(k_per_req, history_pages)
         k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
 
-        if num_pages_cpu is not None:
+        if fixed_capacity:
+            history_capacity = max(max_num_pages - self.num_recent_pages, 0)
+            max_k = (
+                min(
+                    max(int(history_capacity * self.sparsity_ratio), 1),
+                    history_capacity,
+                )
+                if history_capacity > 0
+                else 0
+            )
+            score_order_required = True
+        elif num_pages_cpu is not None:
             k_per_req_cpu = []
             for count in num_pages_cpu:
                 if count <= self.num_recent_pages:
@@ -540,6 +579,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             score_order_required=score_order_required,
             recent_idx=recent_idx,
             recent_valid=recent_valid,
+            fixed_capacity=bool(fixed_capacity),
         )
 
     @staticmethod
@@ -655,6 +695,32 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             dim=1,
             sorted=plan.score_order_required,
         )
+        return self._finalize_topk_with_recent(topk_scores, topk_idx, plan)
+
+    def _finalize_topk_with_recent(
+        self,
+        topk_scores: torch.Tensor,
+        topk_idx: torch.Tensor,
+        plan: _RetrievalPlan,
+    ) -> tuple:
+        """Finalize fixed-capacity CUDA retrievals without torch intermediates."""
+        combined_width = topk_scores.shape[1] + plan.recent_idx.shape[1]
+        if plan.fixed_capacity and topk_scores.is_cuda and torch.version.hip is None:
+            from sglang.srt.mem_cache.sparsity.kernels.quest_finalize import (
+                QUEST_FINALIZE_MAX_WIDTH,
+                quest_finalize_selected_pages,
+            )
+
+            if combined_width <= QUEST_FINALIZE_MAX_WIDTH:
+                return quest_finalize_selected_pages(
+                    topk_scores,
+                    topk_idx,
+                    plan.k_per_req,
+                    plan.recent_idx,
+                    plan.recent_valid,
+                )
+
+        device = topk_scores.device
         topk_idx = topk_idx.to(torch.long)
         topk_rank = torch.arange(plan.max_k, device=device, dtype=torch.long)
         topk_valid = (

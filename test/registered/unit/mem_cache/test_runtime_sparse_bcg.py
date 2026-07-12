@@ -70,6 +70,51 @@ class TestBreakableSparseAttention(unittest.TestCase):
         dense_forward.assert_called_once()
         coordinator.attention_end.assert_not_called()
 
+    def test_graph_safe_decode_captures_retrieval_without_a_break(self):
+        backend = SimpleNamespace(forward_metadata=_metadata())
+        coordinator = SimpleNamespace(
+            enable_cuda_graph_retrieval=True,
+            attention_end=Mock(),
+        )
+        output = torch.ones((1, 4))
+        forward_batch = SimpleNamespace(
+            forward_mode=_ForwardMode(decode=True),
+            runtime_sparse_page_capacity=640,
+        )
+        context = SimpleNamespace(
+            attn_backend=backend, runtime_sparse_coordinator=coordinator
+        )
+
+        with (
+            patch.object(radix_attention, "get_forward_context", return_value=context),
+            patch.object(
+                radix_attention, "is_in_breakable_cuda_graph", return_value=True
+            ),
+            patch.object(
+                radix_attention, "sparse_attention_begin", return_value=None
+            ) as attention_begin,
+            patch.object(
+                radix_attention, "breakable_sparse_attention_begin", return_value=None
+            ) as breakable_begin,
+            patch.object(
+                radix_attention, "_dense_attention_forward", return_value=output
+            ),
+        ):
+            result = radix_attention.sparse_attention_forward(
+                torch.empty((1, 4)),
+                torch.empty((1, 4)),
+                torch.empty((1, 4)),
+                SimpleNamespace(),
+                forward_batch,
+                True,
+            )
+
+        self.assertIs(result, output)
+        attention_begin.assert_called_once()
+        self.assertEqual(attention_begin.call_args.kwargs["fixed_capacity"], 640)
+        breakable_begin.assert_not_called()
+        coordinator.attention_end.assert_not_called()
+
     def test_eager_decode_keeps_per_layer_retrieval_and_update(self):
         backend = SimpleNamespace(forward_metadata=_metadata())
         coordinator = SimpleNamespace(attention_end=Mock())
@@ -173,6 +218,25 @@ class TestBreakableSparseAttention(unittest.TestCase):
 
 
 class TestSparseCoordinatorForwardEnd(unittest.TestCase):
+    def test_selects_smallest_graph_page_bucket_from_host_lengths(self):
+        coordinator = object.__new__(SparseCoordinator)
+        coordinator.page_size = 16
+        coordinator.cuda_graph_page_buckets = (640, 2112, 2560)
+
+        self.assertEqual(
+            coordinator.select_cuda_graph_page_capacity(torch.tensor([8192, 9000])),
+            640,
+        )
+        self.assertEqual(
+            coordinator.select_cuda_graph_page_capacity([32000, 32128]),
+            2112,
+        )
+        self.assertEqual(
+            coordinator.select_cuda_graph_page_capacity([40000]),
+            2560,
+        )
+        self.assertIsNone(coordinator.select_cuda_graph_page_capacity([40961]))
+
     def test_dispatches_decode_representation_updates_once_per_layer(self):
         coordinator = object.__new__(SparseCoordinator)
         coordinator.start_layer = 2

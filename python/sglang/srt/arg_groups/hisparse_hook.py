@@ -393,8 +393,8 @@ def apply_runtime_sparse_cuda_graph_defaults(server_args: ServerArgs) -> None:
         and (Phase.DECODE, "backend") not in locked
     ):
         logger.warning(
-            "%s uses breakable decode CUDA graph so query-dependent sparse "
-            "retrieval can run outside captured graph segments.",
+            "%s uses breakable decode CUDA graph. Graph-safe retrieval is "
+            "captured when supported; other paths retain eager graph breaks.",
             sparse_algorithm_subject,
         )
         server_args.cuda_graph_config.decode.backend = Backend.BREAKABLE

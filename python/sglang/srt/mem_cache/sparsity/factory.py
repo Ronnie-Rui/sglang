@@ -200,6 +200,32 @@ def parse_runtime_sparse_config(server_args) -> SparseConfig:
             "Sparse runtime config use_triton_score_kernel must be a boolean, "
             f"got {use_triton_score_kernel!r}."
         )
+    enable_cuda_graph_retrieval = config.sparse_extra_config.get(
+        "enable_cuda_graph_retrieval"
+    )
+    if "enable_cuda_graph_retrieval" in config.sparse_extra_config and not isinstance(
+        enable_cuda_graph_retrieval, bool
+    ):
+        raise ValueError(
+            "Sparse runtime config enable_cuda_graph_retrieval must be a boolean, "
+            f"got {enable_cuda_graph_retrieval!r}."
+        )
+    cuda_graph_context_buckets = config.sparse_extra_config.get(
+        "cuda_graph_context_buckets"
+    )
+    if cuda_graph_context_buckets is not None and (
+        not isinstance(cuda_graph_context_buckets, list)
+        or not cuda_graph_context_buckets
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in cuda_graph_context_buckets
+        )
+    ):
+        raise ValueError(
+            "Sparse runtime config cuda_graph_context_buckets must be a "
+            "non-empty list of positive integers, "
+            f"got {cuda_graph_context_buckets!r}."
+        )
     return config
 
 
@@ -210,6 +236,7 @@ def create_sparse_coordinator(
     start_layer: int,
     end_layer: int,
     server_args,
+    max_context_len: Optional[int] = None,
     **kwargs,
 ) -> SparseCoordinator:
     config = parse_runtime_sparse_config(server_args)
@@ -227,6 +254,7 @@ def create_sparse_coordinator(
         start_layer=start_layer,
         end_layer=end_layer,
         device=device,
+        max_context_len=max_context_len,
     )
     register_sparse_coordinator(coordinator)
     return coordinator
