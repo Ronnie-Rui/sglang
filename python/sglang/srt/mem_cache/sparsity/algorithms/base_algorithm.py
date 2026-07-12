@@ -1,10 +1,38 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+@dataclass
+class _RetrievalPlan:
+    """Layer-invariant inputs for one sparse decode forward."""
+
+    forward_batch: "ForwardBatch"
+    batch_size: int
+    device: torch.device
+    seq_lens: torch.Tensor
+    seq_lens_cpu: list[int] | None
+    req_pool_indices: torch.Tensor
+    sparse_mask: torch.Tensor
+    num_pages: torch.Tensor
+    num_pages_cpu: list[int] | None
+    max_num_pages: int
+    page_idx: torch.Tensor
+    physical_pages: torch.Tensor
+    valid_page_mask: torch.Tensor
+    active_mask: torch.Tensor
+    recent_start: torch.Tensor
+    history_page_mask: torch.Tensor
+    k_per_req: torch.Tensor
+    max_k: int
+    score_order_required: bool
+    recent_idx: torch.Tensor
+    recent_valid: torch.Tensor
 
 
 class BaseSparseAlgorithm(ABC):
@@ -28,6 +56,25 @@ class BaseSparseAlgorithm(ABC):
         self.device = device
         self.req_to_token_pool = None
         self.states = None
+
+    def begin_forward(
+        self,
+        forward_batch: "ForwardBatch",
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        """Prepare algorithm state shared by every layer in one forward."""
+
+    def should_update_representations(self, forward_batch: "ForwardBatch") -> bool:
+        """Return whether this decode forward may have completed a page."""
+        return True
+
+    def get_selected_physical_pages(
+        self, selected_indices: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Return a cached physical mapping when the algorithm has one."""
+        return None
 
     def initialize_representation_pool(
         self,
@@ -131,7 +178,8 @@ class BaseSparseAlgorithm(ABC):
             valid_lengths: [bs] Actual number of selected indices per request
 
         Note:
-            - Indices are logical positions that will be mapped to physical KV cache by BackendAdaptor
+            - Indices are logical positions. Implementations may expose a cached
+              physical mapping to BackendAdaptor via get_selected_physical_pages().
 
         Algorithm-specific implementations:
             - ChunkKV: Select top-k chunks based on pre-computed importance scores with layer-wise index reuse
@@ -165,6 +213,70 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         self.sparsity_ratio = config.sparse_extra_config.get("sparsity_ratio", 0.7)
         self.num_recent_pages = config.sparse_extra_config.get("num_recent_pages", 4)
         self.page_size = config.page_size
+        self._retrieval_plan: _RetrievalPlan | None = None
+        self._representation_update_batch = None
+        self._representation_update_due: bool | None = None
+
+    def begin_forward(
+        self,
+        forward_batch: "ForwardBatch",
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        """Cache decode metadata that is identical across attention layers."""
+        self._representation_update_batch = forward_batch
+        if self.req_to_token_pool is None:
+            self._retrieval_plan = None
+            self._representation_update_due = self._decode_page_boundary_reached(
+                forward_batch
+            )
+            return
+        self._retrieval_plan = self._build_retrieval_plan(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            device,
+        )
+        self._representation_update_due = self._has_completed_page(
+            self._retrieval_plan.seq_lens_cpu
+        )
+
+    def should_update_representations(self, forward_batch: "ForwardBatch") -> bool:
+        if self._representation_update_batch is not forward_batch:
+            self._representation_update_batch = forward_batch
+            self._representation_update_due = self._decode_page_boundary_reached(
+                forward_batch
+            )
+        # A missing CPU mirror means the cheap host gate is unavailable. Let
+        # the existing device-side valid mask make the final decision.
+        return self._representation_update_due is not False
+
+    def get_selected_physical_pages(
+        self, selected_indices: torch.Tensor
+    ) -> torch.Tensor | None:
+        plan = self._retrieval_plan
+        if (
+            plan is None
+            or selected_indices.ndim != 2
+            or plan.physical_pages.shape[0] != selected_indices.shape[0]
+        ):
+            return None
+
+        if plan.physical_pages.shape[1] == 0:
+            return torch.zeros_like(selected_indices, dtype=torch.int32)
+
+        logical_pages = selected_indices.to(torch.long)
+        physical_pages = torch.gather(
+            plan.physical_pages,
+            1,
+            logical_pages.clamp(min=0, max=plan.physical_pages.shape[1] - 1),
+        )
+        return torch.where(
+            logical_pages >= 0,
+            physical_pages,
+            torch.zeros_like(physical_pages),
+        ).to(torch.int32)
 
     def initialize_representation_pool(
         self,
@@ -249,23 +361,8 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if not forward_batch.forward_mode.is_decode():
             return
 
-        # A decode step can create a new complete representation page only
-        # when a sequence length lands exactly on a page boundary. Use the
-        # existing CPU mirror to skip the GPU mask reduction on all other
-        # steps (normally page_size - 1 out of every page_size iterations).
-        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-        if seq_lens_cpu is not None:
-            if torch.is_tensor(seq_lens_cpu):
-                completed_page = (seq_lens_cpu > 0) & (
-                    seq_lens_cpu % self.page_size == 0
-                )
-                if not bool(completed_page.any()):
-                    return
-            elif not any(
-                seq_len > 0 and seq_len % self.page_size == 0
-                for seq_len in seq_lens_cpu
-            ):
-                return
+        if not self.should_update_representations(forward_batch):
+            return
 
         end_page = seq_lens // self.page_size
         constructed = self.states.repr_constructed[req_pool_indices]
@@ -318,28 +415,131 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             raise ValueError(
                 "forward_batch with seq_lens is required for TopK retrieval"
             )
-        seq_lens = seq_lens_source.seq_lens.to(device=device, dtype=torch.long)
-        req_pool_indices = req_pool_indices.to(device=device, dtype=torch.long)
-        sparse_mask = sparse_mask.to(device=device, dtype=torch.bool)
+        plan = self._retrieval_plan
+        if (
+            plan is None
+            or plan.forward_batch is not seq_lens_source
+            or plan.batch_size != bs
+            or plan.device != device
+        ):
+            plan = self._build_retrieval_plan(
+                seq_lens_source,
+                req_pool_indices,
+                sparse_mask,
+                device,
+            )
+            self._retrieval_plan = plan
 
-        seq_lens_cpu = self._get_seq_lens_cpu(seq_lens_source, bs)
         if bs == 1:
             return self._retrieve_topk_single(
                 queries,
                 layer_id,
-                req_pool_indices,
-                sparse_mask,
-                seq_lens,
-                seq_lens_cpu,
+                plan,
             )
 
         return self._retrieve_topk_batched(
             queries,
             layer_id,
-            req_pool_indices,
-            sparse_mask,
-            seq_lens,
-            seq_lens_cpu,
+            plan,
+        )
+
+    def _build_retrieval_plan(
+        self,
+        forward_batch: "ForwardBatch",
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        device: torch.device,
+    ) -> _RetrievalPlan:
+        """Build the page layout and selection sizes once per forward."""
+        bs = req_pool_indices.numel()
+        seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.long)
+        seq_lens_cpu = self._get_seq_lens_cpu(forward_batch, bs)
+        req_pool_indices = req_pool_indices.to(device=device, dtype=torch.long)
+        sparse_mask = sparse_mask.to(device=device, dtype=torch.bool)
+        num_pages = (seq_lens + self.page_size - 1) // self.page_size
+
+        if seq_lens_cpu is not None:
+            num_pages_cpu = [
+                max((seq_len + self.page_size - 1) // self.page_size, 0)
+                for seq_len in seq_lens_cpu
+            ]
+            max_num_pages = max(num_pages_cpu, default=0)
+        else:
+            num_pages_cpu = None
+            max_num_pages = int(num_pages.max().item()) if bs > 0 else 0
+
+        page_idx = torch.arange(max_num_pages, device=device, dtype=torch.long)
+        valid_page_mask = page_idx.unsqueeze(0) < num_pages.unsqueeze(1)
+        req_to_token = self.req_to_token_pool.req_to_token
+        if max_num_pages > 0:
+            page_starts = (page_idx * self.page_size).clamp(
+                0, req_to_token.shape[1] - 1
+            )
+            physical_pages = (
+                req_to_token[
+                    req_pool_indices[:, None],
+                    page_starts[None, :],
+                ].to(torch.long)
+                // self.page_size
+            )
+        else:
+            physical_pages = torch.empty((bs, 0), device=device, dtype=torch.long)
+
+        active_mask = sparse_mask & (num_pages > self.num_recent_pages)
+        recent_start = (num_pages - self.num_recent_pages).clamp(min=0)
+        history_page_mask = page_idx.unsqueeze(0) < recent_start.unsqueeze(1)
+        history_pages = recent_start.clamp(min=1)
+        k_per_req = (history_pages.to(torch.float32) * self.sparsity_ratio).to(
+            torch.long
+        )
+        k_per_req = torch.maximum(k_per_req, torch.ones_like(k_per_req))
+        k_per_req = torch.minimum(k_per_req, history_pages)
+        k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
+
+        if num_pages_cpu is not None:
+            k_per_req_cpu = []
+            for count in num_pages_cpu:
+                if count <= self.num_recent_pages:
+                    k_per_req_cpu.append(0)
+                    continue
+                history_count = count - self.num_recent_pages
+                k_per_req_cpu.append(
+                    min(max(int(history_count * self.sparsity_ratio), 1), history_count)
+                )
+            max_k = max(k_per_req_cpu, default=0)
+            positive_k = {k for k in k_per_req_cpu if k > 0}
+            score_order_required = len(positive_k) > 1
+        else:
+            max_k = int(k_per_req.max().item()) if bs > 0 else 0
+            score_order_required = True
+
+        recent_offsets = torch.arange(
+            self.num_recent_pages, device=device, dtype=torch.long
+        )
+        recent_idx = recent_start.unsqueeze(1) + recent_offsets.unsqueeze(0)
+        recent_valid = active_mask.unsqueeze(1) & (recent_idx < num_pages.unsqueeze(1))
+        return _RetrievalPlan(
+            forward_batch=forward_batch,
+            batch_size=bs,
+            device=device,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            req_pool_indices=req_pool_indices,
+            sparse_mask=sparse_mask,
+            num_pages=num_pages,
+            num_pages_cpu=num_pages_cpu,
+            max_num_pages=max_num_pages,
+            page_idx=page_idx,
+            physical_pages=physical_pages,
+            valid_page_mask=valid_page_mask,
+            active_mask=active_mask,
+            recent_start=recent_start,
+            history_page_mask=history_page_mask,
+            k_per_req=k_per_req,
+            max_k=max_k,
+            score_order_required=score_order_required,
+            recent_idx=recent_idx,
+            recent_valid=recent_valid,
         )
 
     @staticmethod
@@ -363,55 +563,61 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
 
         return [int(seq_len) for seq_len in values]
 
+    def _decode_page_boundary_reached(
+        self, forward_batch: "ForwardBatch"
+    ) -> bool | None:
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if seq_lens is not None:
+            bs = seq_lens.numel()
+        else:
+            host_seq_lens = getattr(forward_batch, "seq_lens_cpu", None)
+            if torch.is_tensor(host_seq_lens):
+                bs = host_seq_lens.numel()
+            else:
+                try:
+                    bs = len(host_seq_lens)
+                except TypeError:
+                    return None
+        seq_lens_cpu = self._get_seq_lens_cpu(forward_batch, bs)
+        return self._has_completed_page(seq_lens_cpu)
+
+    def _has_completed_page(self, seq_lens_cpu: list[int] | None) -> bool | None:
+        if seq_lens_cpu is None:
+            return None
+        return any(
+            seq_len > 0 and seq_len % self.page_size == 0 for seq_len in seq_lens_cpu
+        )
+
     def _retrieve_topk_single(
         self,
         queries: torch.Tensor,
         layer_id: int,
-        req_pool_indices: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu,
+        plan: _RetrievalPlan,
     ) -> tuple:
         """Low-overhead path for the latency-sensitive single-request case."""
         device = queries.device
-        seq_len = (
-            seq_lens_cpu[0] if seq_lens_cpu is not None else int(seq_lens[0].item())
-        )
-        num_pages = max((seq_len + self.page_size - 1) // self.page_size, 0)
+        num_pages = plan.max_num_pages
         if num_pages <= self.num_recent_pages:
             return self._empty_retrieval(1, device)
 
-        req_to_token = self.req_to_token_pool.req_to_token
-        page_idx = torch.arange(num_pages, device=device, dtype=torch.long)
-        page_starts = (page_idx * self.page_size).clamp(0, req_to_token.shape[1] - 1)
-        phys_pages = (
-            req_to_token[req_pool_indices[0], page_starts].to(torch.long)
-            // self.page_size
-        ).unsqueeze(0)
         scores = self._retrieve_page_scores(
             layer_id,
-            phys_pages,
-            req_pool_indices,
+            plan.physical_pages,
+            plan.req_pool_indices,
             queries,
         )
 
         recent_start = num_pages - self.num_recent_pages
-        k = max(int(recent_start * self.sparsity_ratio), 1)
-        k = min(k, recent_start)
+        k = plan.max_k
         topk_scores, topk_idx = torch.topk(
             scores[:, :recent_start], k=k, dim=1, sorted=False
         )
-        active = sparse_mask.view(1, 1)
+        active = plan.sparse_mask.view(1, 1)
         topk_valid = active & torch.isfinite(topk_scores)
 
-        recent_idx = torch.arange(
-            recent_start, num_pages, device=device, dtype=torch.long
-        ).unsqueeze(0)
-        recent_valid = active.expand_as(recent_idx)
-
         return self._finalize_selected_pages(
-            torch.cat([topk_idx.to(torch.long), recent_idx], dim=1),
-            torch.cat([topk_valid, recent_valid], dim=1),
+            torch.cat([topk_idx.to(torch.long), plan.recent_idx], dim=1),
+            torch.cat([topk_valid, plan.recent_valid], dim=1),
             num_pages,
         )
 
@@ -419,102 +625,47 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         self,
         queries: torch.Tensor,
         layer_id: int,
-        req_pool_indices: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu,
+        plan: _RetrievalPlan,
     ) -> tuple:
         """Vectorized retrieval for batches, including ragged sequence lengths."""
         bs, device = queries.shape[0], queries.device
-        req_to_token = self.req_to_token_pool.req_to_token
-        max_req_tokens = req_to_token.shape[1]
-
-        num_pages = (seq_lens + self.page_size - 1) // self.page_size
-        if seq_lens_cpu is not None:
-            num_pages_cpu = [
-                max((seq_len + self.page_size - 1) // self.page_size, 0)
-                for seq_len in seq_lens_cpu
-            ]
-            max_num_pages = max(num_pages_cpu, default=0)
-        else:
-            num_pages_cpu = None
-            max_num_pages = int(num_pages.max().item()) if bs > 0 else 0
-
-        if max_num_pages <= self.num_recent_pages:
+        if plan.max_num_pages <= self.num_recent_pages:
             return self._empty_retrieval(bs, device)
-
-        page_idx = torch.arange(max_num_pages, device=device, dtype=torch.long)
-        valid_page_mask = page_idx.unsqueeze(0) < num_pages.unsqueeze(1)
-
-        page_starts = (page_idx * self.page_size).clamp(0, max_req_tokens - 1)
-        phys_pages = (
-            req_to_token[req_pool_indices[:, None], page_starts[None, :]].to(torch.long)
-            // self.page_size
-        )
 
         scores = self._retrieve_page_scores(
             layer_id,
-            phys_pages,
-            req_pool_indices,
+            plan.physical_pages,
+            plan.req_pool_indices,
             queries,
         )
 
-        active_mask = sparse_mask & (num_pages > self.num_recent_pages)
-        recent_start = (num_pages - self.num_recent_pages).clamp(min=0)
-        history_page_mask = page_idx.unsqueeze(0) < recent_start.unsqueeze(1)
-        score_mask = active_mask.unsqueeze(1) & valid_page_mask & history_page_mask
+        score_mask = (
+            plan.active_mask.unsqueeze(1)
+            & plan.valid_page_mask
+            & plan.history_page_mask
+        )
         scores = torch.where(score_mask, scores, torch.full_like(scores, float("-inf")))
 
-        history_pages = recent_start.clamp(min=1)
-        k_per_req = (history_pages.to(torch.float32) * self.sparsity_ratio).to(
-            torch.long
-        )
-        k_per_req = torch.maximum(k_per_req, torch.ones_like(k_per_req))
-        k_per_req = torch.minimum(k_per_req, history_pages)
-        k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
-
-        if num_pages_cpu is not None:
-            k_per_req_cpu = []
-            for count in num_pages_cpu:
-                if count <= self.num_recent_pages:
-                    k_per_req_cpu.append(0)
-                    continue
-                history_count = count - self.num_recent_pages
-                k_per_req_cpu.append(
-                    min(max(int(history_count * self.sparsity_ratio), 1), history_count)
-                )
-            max_k = max(k_per_req_cpu, default=0)
-            positive_k = {k for k in k_per_req_cpu if k > 0}
-            score_order_required = len(positive_k) > 1
-        else:
-            max_k = int(k_per_req.max().item())
-            # Without host metadata, avoid another device synchronization just
-            # to determine whether all active rows have the same k.
-            score_order_required = True
-
-        if max_k <= 0:
+        if plan.max_k <= 0:
             return self._empty_retrieval(bs, device)
 
         topk_scores, topk_idx = torch.topk(
-            scores, k=max_k, dim=1, sorted=score_order_required
+            scores,
+            k=plan.max_k,
+            dim=1,
+            sorted=plan.score_order_required,
         )
         topk_idx = topk_idx.to(torch.long)
-        topk_rank = torch.arange(max_k, device=device, dtype=torch.long)
-        topk_valid = (topk_rank.unsqueeze(0) < k_per_req.unsqueeze(1)) & torch.isfinite(
-            topk_scores
-        )
+        topk_rank = torch.arange(plan.max_k, device=device, dtype=torch.long)
+        topk_valid = (
+            topk_rank.unsqueeze(0) < plan.k_per_req.unsqueeze(1)
+        ) & torch.isfinite(topk_scores)
 
-        recent_offsets = torch.arange(
-            self.num_recent_pages, device=device, dtype=torch.long
-        )
-        recent_idx = recent_start.unsqueeze(1) + recent_offsets.unsqueeze(0)
-        recent_valid = active_mask.unsqueeze(1) & (recent_idx < num_pages.unsqueeze(1))
-
-        combined_idx = torch.cat([topk_idx, recent_idx], dim=1)
-        combined_valid = torch.cat([topk_valid, recent_valid], dim=1)
+        combined_idx = torch.cat([topk_idx, plan.recent_idx], dim=1)
+        combined_valid = torch.cat([topk_valid, plan.recent_valid], dim=1)
 
         return self._finalize_selected_pages(
-            combined_idx, combined_valid, max_num_pages
+            combined_idx, combined_valid, plan.max_num_pages
         )
 
     @staticmethod

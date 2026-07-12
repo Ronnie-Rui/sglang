@@ -37,6 +37,7 @@ class BackendAdaptor(ABC):
         req_to_token: torch.Tensor,
         page_size: int,
         layer_id: int,
+        selected_physical_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Any:
         """
@@ -72,6 +73,7 @@ class DSABackendAdaptor(BackendAdaptor):
         req_to_token: torch.Tensor,
         page_size: int,
         layer_id: int,
+        selected_physical_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """
@@ -133,6 +135,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
         req_to_token: torch.Tensor,
         page_size: int,
         layer_id: int,
+        selected_physical_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Any:
         """
@@ -146,12 +149,14 @@ class FlashAttentionAdaptor(BackendAdaptor):
         if self._original_metadata is None:
             return current_metadata
 
-        physical_pages = self._logical_to_physical_pages_batch(
-            selected_indices,
-            forward_batch.req_pool_indices,
-            req_to_token,
-            page_size,
-        )
+        physical_pages = selected_physical_indices
+        if physical_pages is None:
+            physical_pages = self._logical_to_physical_pages_batch(
+                selected_indices,
+                forward_batch.req_pool_indices,
+                req_to_token,
+                page_size,
+            )
 
         max_selected = physical_pages.shape[1]
         if not self._metadata_prepared:

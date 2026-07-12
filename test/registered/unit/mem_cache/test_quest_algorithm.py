@@ -7,6 +7,7 @@ server or call a real attention backend.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -344,6 +345,71 @@ class TestQuestRetrieveTopkEquivalence(CustomTestCase):
 
         self.assertEqual(lengths.tolist(), [4])
         self.assertEqual(indices[0].tolist(), [1, 4, 6, 7, -1, -1])
+
+    def test_forward_plan_reuses_ragged_layout_and_physical_mapping(self):
+        seq_lens = torch.tensor([9, 5], dtype=torch.int64, device=self.device)
+        algo, _ = _make_algorithm(
+            batch_size=2,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+        )
+        forward_batch = _FakeForwardBatch(seq_lens)
+        req_pool_indices = torch.arange(2, device=self.device)
+        sparse_mask = torch.ones(2, dtype=torch.bool, device=self.device)
+
+        with patch.object(
+            algo,
+            "_get_seq_lens_cpu",
+            wraps=algo._get_seq_lens_cpu,
+        ) as get_seq_lens_cpu:
+            algo.begin_forward(
+                forward_batch,
+                req_pool_indices,
+                sparse_mask,
+                self.device,
+            )
+        get_seq_lens_cpu.assert_called_once_with(forward_batch, 2)
+        plan = algo._retrieval_plan
+        self.assertEqual(plan.seq_lens_cpu, [9, 5])
+        self.assertEqual(plan.num_pages_cpu, [9, 5])
+        self.assertEqual(plan.k_per_req.tolist(), [4, 2])
+        self.assertEqual(plan.max_k, 4)
+
+        queries = torch.zeros((2, 1, 1), device=self.device)
+        with patch.object(
+            algo,
+            "_build_retrieval_plan",
+            wraps=algo._build_retrieval_plan,
+        ) as build_plan:
+            selected_indices, _ = algo.retrieve_topk(
+                queries,
+                0,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+            )
+            algo.retrieve_topk(
+                queries,
+                0,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+            )
+        build_plan.assert_not_called()
+
+        physical_pages = algo.get_selected_physical_pages(selected_indices)
+        expected = torch.where(
+            selected_indices >= 0,
+            selected_indices + torch.tensor([[0], [9]], dtype=torch.int32),
+            torch.zeros_like(selected_indices),
+        )
+        torch.testing.assert_close(physical_pages, expected)
 
 
 def _reference_compute_page_reps_masked(

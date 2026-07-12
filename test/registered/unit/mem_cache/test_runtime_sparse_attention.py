@@ -19,6 +19,40 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestFlashAttentionAdaptor(unittest.TestCase):
+    def test_uses_precomputed_physical_pages_without_remapping(self):
+        adaptor = FlashAttentionAdaptor(torch.device("cpu"))
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[0, 1]], dtype=torch.int32),
+            cache_seqlens_int32=torch.tensor([8], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 8], dtype=torch.int32),
+            max_seq_len_k=8,
+            scheduler_metadata=None,
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([8], dtype=torch.int64),
+        )
+        adaptor.save_original_metadata(metadata)
+
+        with patch.object(
+            adaptor,
+            "_logical_to_physical_pages_batch",
+            side_effect=AssertionError("unexpected remap"),
+        ):
+            adaptor.adapt_for_attn_metadata(
+                selected_indices=torch.tensor([[0, 1]], dtype=torch.int32),
+                valid_lengths=torch.tensor([2], dtype=torch.int32),
+                sparse_mask=torch.tensor([True]),
+                current_metadata=metadata,
+                forward_batch=forward_batch,
+                req_to_token=torch.arange(8, dtype=torch.int64).view(1, 8),
+                page_size=4,
+                layer_id=0,
+                selected_physical_indices=torch.tensor([[7, 3]], dtype=torch.int32),
+            )
+
+        self.assertEqual(metadata.page_table.tolist(), [[7, 3]])
+
     def test_rewrites_flashattention_metadata_in_place(self):
         adaptor = FlashAttentionAdaptor(torch.device("cpu"))
         metadata = SimpleNamespace(

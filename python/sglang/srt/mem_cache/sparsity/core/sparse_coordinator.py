@@ -131,6 +131,7 @@ class SparseCoordinator:
             self.req_to_token_pool,
             self.states,
         )
+        self._forward_sparse_mask = None
 
         logger.info(
             f"SparseCoordinator initialized with sparse algorithm={type(algorithm).__name__}"
@@ -165,9 +166,18 @@ class SparseCoordinator:
         Wait for pending KVCache offloading operations to complete before forward pass.
         Ensures memory consistency for subsequent sparse attention operations.
         """
-        # TODO: Implement forward begin handling
-        # - Check if there are pending offloading operations
-        pass
+        req_pool_indices = forward_batch.req_pool_indices
+        if req_pool_indices is None:
+            self._forward_sparse_mask = None
+            return
+
+        self._forward_sparse_mask = self._compute_sparse_mask(req_pool_indices)
+        self.algorithm.begin_forward(
+            forward_batch=forward_batch,
+            req_pool_indices=req_pool_indices,
+            sparse_mask=self._forward_sparse_mask,
+            device=forward_batch.seq_lens.device,
+        )
 
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """
@@ -183,6 +193,11 @@ class SparseCoordinator:
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         if req_pool_indices is None or seq_lens is None:
+            return
+
+        # A decode step completes a representation page only at a page
+        # boundary. Gate once before touching any layer buffers.
+        if not self.algorithm.should_update_representations(forward_batch):
             return
 
         for layer_id in range(self.start_layer, self.end_layer):
@@ -211,6 +226,7 @@ class SparseCoordinator:
         and adapt attention metadata for the attention backend.
         """
         if layer.layer_id == self.start_layer:
+            self.forward_begin(forward_batch)
             self.backend_adaptor.save_original_metadata(attn_metadata)
 
         return self._handle_sparse_retrieve(
@@ -260,7 +276,9 @@ class SparseCoordinator:
         layer_id = layer.layer_id
 
         # Compute Topk
-        sparse_mask = self._compute_sparse_mask(req_pool_indices)
+        sparse_mask = self._forward_sparse_mask
+        if sparse_mask is None:
+            sparse_mask = self._compute_sparse_mask(req_pool_indices)
         selected_indices, valid_lengths = self.algorithm.retrieve_topk(
             queries=query,
             layer_id=layer_id,
@@ -269,6 +287,9 @@ class SparseCoordinator:
             forward_batch=forward_batch,
             attn_metadata=attn_metadata,
             **kwargs,
+        )
+        selected_physical_indices = self.algorithm.get_selected_physical_pages(
+            selected_indices
         )
 
         # Adapt Attention Metadata
@@ -281,6 +302,7 @@ class SparseCoordinator:
             req_to_token=self.req_to_token_pool.req_to_token,
             page_size=self.page_size,
             layer_id=layer.layer_id,
+            selected_physical_indices=selected_physical_indices,
         )
 
     def _compute_sparse_mask(self, req_pool_indices):

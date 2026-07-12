@@ -177,7 +177,10 @@ class TestSparseCoordinatorForwardEnd(unittest.TestCase):
         coordinator = object.__new__(SparseCoordinator)
         coordinator.start_layer = 2
         coordinator.end_layer = 5
-        coordinator.algorithm = SimpleNamespace(update_representations=Mock())
+        coordinator.algorithm = SimpleNamespace(
+            should_update_representations=Mock(return_value=True),
+            update_representations=Mock(),
+        )
         coordinator.token_to_kv_pool = SimpleNamespace(
             get_key_buffer=Mock(side_effect=lambda layer_id: f"key-{layer_id}")
         )
@@ -199,6 +202,29 @@ class TestSparseCoordinatorForwardEnd(unittest.TestCase):
         )
         for call in coordinator.algorithm.update_representations.call_args_list:
             self.assertIs(call.kwargs["forward_batch"], forward_batch)
+
+    def test_skips_all_layer_buffers_away_from_page_boundary(self):
+        coordinator = object.__new__(SparseCoordinator)
+        coordinator.start_layer = 2
+        coordinator.end_layer = 5
+        coordinator.algorithm = SimpleNamespace(
+            should_update_representations=Mock(return_value=False),
+            update_representations=Mock(),
+        )
+        coordinator.token_to_kv_pool = SimpleNamespace(get_key_buffer=Mock())
+        forward_batch = SimpleNamespace(
+            forward_mode=_ForwardMode(decode=True),
+            req_pool_indices=torch.tensor([3]),
+            seq_lens=torch.tensor([31]),
+        )
+
+        coordinator.forward_end(forward_batch)
+
+        coordinator.algorithm.should_update_representations.assert_called_once_with(
+            forward_batch
+        )
+        coordinator.token_to_kv_pool.get_key_buffer.assert_not_called()
+        coordinator.algorithm.update_representations.assert_not_called()
 
 
 if __name__ == "__main__":
