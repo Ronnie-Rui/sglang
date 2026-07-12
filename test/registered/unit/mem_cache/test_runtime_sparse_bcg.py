@@ -161,7 +161,7 @@ class TestBreakableSparseAttention(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(
-                RuntimeError, "tensor addresses must remain stable"
+                RuntimeError, "replaced one or more forward metadata tensors"
             ):
                 radix_attention.sparse_attention_begin(
                     torch.empty((1, 4)),

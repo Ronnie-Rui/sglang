@@ -314,15 +314,14 @@ def sparse_attention_forward(
     # A BCG replay does not execute this Python body. Decode representation
     # updates are therefore scheduled once after replay by SparseCoordinator.forward_end.
     # Eager decode and extend/prefill retain their existing per-layer behavior.
-    if not (
-        forward_batch.forward_mode.is_decode() and is_in_breakable_cuda_graph()
-    ):
+    if not (forward_batch.forward_mode.is_decode() and is_in_breakable_cuda_graph()):
         runtime_sparse_coordinator.attention_end(output, layer, forward_batch)
     return output
 
 
-# Metadata tensors consumed by a captured FA kernel must keep the exact addresses
-# seen at capture. The adaptor may rewrite their contents, but never replace them.
+# The FA backend owns fixed per-shape metadata buffers across capture and replay.
+# This guard covers the narrower adaptor contract within one eager graph break:
+# rewrite the current buffers in place and never replace the object or tensors.
 _BCG_STABLE_METADATA_FIELDS = (
     "page_table",
     "cache_seqlens_int32",
@@ -360,7 +359,7 @@ def sparse_attention_begin(
     runtime_sparse_coordinator = context.runtime_sparse_coordinator
     current_metadata = getattr(attn_backend, "forward_metadata", None)
     in_breakable_graph = is_in_breakable_cuda_graph()
-    captured_addresses = (
+    original_addresses = (
         _metadata_tensor_addresses(current_metadata) if in_breakable_graph else ()
     )
 
@@ -380,15 +379,13 @@ def sparse_attention_begin(
         if new_metadata is not current_metadata:
             raise RuntimeError(
                 "Breakable CUDA Graph sparse attention must rewrite forward "
-                "metadata in place; replacing the metadata object invalidates "
-                "captured FA tensor addresses."
+                "metadata in place; the adaptor replaced the current object."
             )
         updated_addresses = _metadata_tensor_addresses(new_metadata)
-        if updated_addresses != captured_addresses:
+        if updated_addresses != original_addresses:
             raise RuntimeError(
                 "Breakable CUDA Graph sparse attention replaced one or more "
-                "forward metadata tensors; captured FA tensor addresses must "
-                "remain stable."
+                "forward metadata tensors within the eager graph break."
             )
 
     attn_backend.forward_metadata = new_metadata

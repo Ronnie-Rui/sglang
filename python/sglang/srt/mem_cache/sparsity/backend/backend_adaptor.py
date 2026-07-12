@@ -4,8 +4,13 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+_ENABLE_ASYNC_ASSERT = envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +89,13 @@ class FlashAttentionAdaptor(BackendAdaptor):
         self._metadata_prepared = False
         self._page_table_update_mask = None
         self._max_selected = None
+        self._valid_lengths = None
 
     def _reset_forward_state(self) -> None:
         self._metadata_prepared = False
         self._page_table_update_mask = None
         self._max_selected = None
+        self._valid_lengths = None
 
     def save_original_metadata(self, metadata: Any) -> None:
         # The adaptor is reused across forwards (and BCG replays), while the
@@ -154,6 +161,9 @@ class FlashAttentionAdaptor(BackendAdaptor):
             ).unsqueeze(0) < valid_lengths.unsqueeze(1)
             self._page_table_update_mask = active_sparse_mask.unsqueeze(1) & valid_mask
             self._max_selected = max_selected
+            # Keep the first layer's immutable result by reference. Cloning it
+            # would launch a GPU copy even when async assertions are disabled.
+            self._valid_lengths = valid_lengths
 
             seq_lens = forward_batch.seq_lens
             positions_in_page = (seq_lens - 1) % page_size
@@ -189,6 +199,11 @@ class FlashAttentionAdaptor(BackendAdaptor):
             raise ValueError(
                 "Sparse selection width changed within one forward: "
                 f"expected {self._max_selected}, got {max_selected}."
+            )
+        elif _ENABLE_ASYNC_ASSERT:
+            torch._assert_async(
+                (valid_lengths == self._valid_lengths).all(),
+                "Sparse valid lengths changed between layers in one forward.",
             )
 
         page_table = current_metadata.page_table[:, :max_selected]

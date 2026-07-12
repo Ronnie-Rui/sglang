@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -186,6 +187,51 @@ class TestFlashAttentionAdaptor(unittest.TestCase):
         self.assertEqual(metadata.cu_seqlens_k.tolist(), [0, 5])
         self.assertEqual(metadata.max_seq_len_k, 5)
         self.assertIsNone(metadata.scheduler_metadata)
+
+    def test_debug_assert_enforces_layer_invariant_lengths(self):
+        adaptor = FlashAttentionAdaptor(torch.device("cpu"))
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[0, 1]], dtype=torch.int32),
+            cache_seqlens_int32=torch.tensor([8], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 8], dtype=torch.int32),
+            max_seq_len_k=8,
+            scheduler_metadata=None,
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([8], dtype=torch.int64),
+        )
+        req_to_token = torch.arange(8, dtype=torch.int64).view(1, 8)
+        adaptor.save_original_metadata(metadata)
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor([[0, 1]], dtype=torch.int32),
+            valid_lengths=torch.tensor([2], dtype=torch.int32),
+            sparse_mask=torch.tensor([True]),
+            current_metadata=metadata,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=0,
+        )
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.sparsity.backend.backend_adaptor."
+                "_ENABLE_ASYNC_ASSERT",
+                True,
+            ),
+            self.assertRaisesRegex(RuntimeError, "valid lengths changed"),
+        ):
+            adaptor.adapt_for_attn_metadata(
+                selected_indices=torch.tensor([[0, -1]], dtype=torch.int32),
+                valid_lengths=torch.tensor([1], dtype=torch.int32),
+                sparse_mask=torch.tensor([True]),
+                current_metadata=metadata,
+                forward_batch=forward_batch,
+                req_to_token=req_to_token,
+                page_size=4,
+                layer_id=1,
+            )
 
     def test_save_original_metadata_resets_plan_for_next_replay(self):
         adaptor = FlashAttentionAdaptor(torch.device("cpu"))
