@@ -65,8 +65,14 @@ class TestFlashAttentionAdaptor(unittest.TestCase):
         self.assertEqual(metadata.page_table.tolist(), [[2, 2], [1, 3]])
         self.assertEqual(metadata.cache_seqlens_int32.tolist(), [3, 6])
         self.assertEqual(metadata.cu_seqlens_k.tolist(), [0, 3, 9])
+        # Request 1 remains dense, so the batch max must stay a safe upper
+        # bound for its six-token cache rather than shrinking to one page.
         self.assertEqual(metadata.max_seq_len_k, 7)
         self.assertIsNone(metadata.scheduler_metadata)
+
+        cache_seqlens_version = cache_seqlens._version
+        cu_seqlens_version = cu_seqlens._version
+        page_table_version = page_table._version
 
         adaptor.adapt_for_attn_metadata(
             selected_indices=torch.tensor([[0], [0]], dtype=torch.int32),
@@ -80,6 +86,171 @@ class TestFlashAttentionAdaptor(unittest.TestCase):
         )
         self.assertEqual(metadata.page_table.tolist(), [[0, 2], [1, 3]])
         self.assertEqual(metadata.cache_seqlens_int32.tolist(), [3, 6])
+        self.assertEqual(cache_seqlens._version, cache_seqlens_version)
+        self.assertEqual(cu_seqlens._version, cu_seqlens_version)
+        self.assertGreater(page_table._version, page_table_version)
+
+    def test_ragged_mixed_batch_reuses_layer_invariant_metadata(self):
+        adaptor = FlashAttentionAdaptor(torch.device("cpu"))
+        metadata = SimpleNamespace(
+            page_table=torch.tensor(
+                [[10, 11, 12], [20, 21, 22], [30, 31, 32]], dtype=torch.int32
+            ),
+            cache_seqlens_int32=torch.tensor([10, 7, 3], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 10, 17, 20], dtype=torch.int32),
+            max_seq_len_k=10,
+            scheduler_metadata=torch.ones(1, dtype=torch.int32),
+        )
+        req_to_token = torch.tensor(
+            [
+                [0, 1, 2, 3, 12, 13, 14, 15, 24, 25, 26, 27],
+                [4, 5, 6, 7, 16, 17, 18, 19, 28, 29, 30, 31],
+                [8, 9, 10, 11, 20, 21, 22, 23, 32, 33, 34, 35],
+            ],
+            dtype=torch.int64,
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+            seq_lens=torch.tensor([10, 7, 3], dtype=torch.int64),
+        )
+        adaptor.save_original_metadata(metadata)
+
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor(
+                [[2, 0], [1, -1], [0, -1]], dtype=torch.int32
+            ),
+            valid_lengths=torch.tensor([2, 1, 0], dtype=torch.int32),
+            sparse_mask=torch.tensor([True, True, True]),
+            current_metadata=metadata,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=0,
+        )
+
+        self.assertEqual(
+            metadata.page_table.tolist(), [[6, 0, 12], [4, 21, 22], [30, 31, 32]]
+        )
+        self.assertEqual(metadata.cache_seqlens_int32.tolist(), [6, 3, 3])
+        self.assertEqual(metadata.cu_seqlens_k.tolist(), [0, 6, 9, 12])
+        self.assertEqual(metadata.max_seq_len_k, 10)
+
+        cache_seqlens_version = metadata.cache_seqlens_int32._version
+        cu_seqlens_version = metadata.cu_seqlens_k._version
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor(
+                [[1, 2], [0, -1], [2, -1]], dtype=torch.int32
+            ),
+            valid_lengths=torch.tensor([2, 1, 0], dtype=torch.int32),
+            sparse_mask=torch.tensor([True, True, True]),
+            current_metadata=metadata,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=1,
+        )
+
+        self.assertEqual(
+            metadata.page_table.tolist(), [[3, 6, 12], [1, 21, 22], [30, 31, 32]]
+        )
+        self.assertEqual(metadata.cache_seqlens_int32._version, cache_seqlens_version)
+        self.assertEqual(metadata.cu_seqlens_k._version, cu_seqlens_version)
+
+    def test_no_selection_keeps_dense_metadata(self):
+        adaptor = FlashAttentionAdaptor(torch.device("cpu"))
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[9, 10]], dtype=torch.int32),
+            cache_seqlens_int32=torch.tensor([5], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 5], dtype=torch.int32),
+            max_seq_len_k=5,
+            scheduler_metadata=torch.ones(1, dtype=torch.int32),
+        )
+        adaptor.save_original_metadata(metadata)
+
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor([[-1]], dtype=torch.int32),
+            valid_lengths=torch.tensor([0], dtype=torch.int32),
+            sparse_mask=torch.tensor([True]),
+            current_metadata=metadata,
+            forward_batch=SimpleNamespace(
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([5], dtype=torch.int64),
+            ),
+            req_to_token=torch.arange(8, dtype=torch.int64).view(1, 8),
+            page_size=4,
+            layer_id=0,
+        )
+
+        self.assertEqual(metadata.page_table.tolist(), [[9, 10]])
+        self.assertEqual(metadata.cache_seqlens_int32.tolist(), [5])
+        self.assertEqual(metadata.cu_seqlens_k.tolist(), [0, 5])
+        self.assertEqual(metadata.max_seq_len_k, 5)
+        self.assertIsNone(metadata.scheduler_metadata)
+
+    def test_save_original_metadata_resets_plan_for_next_replay(self):
+        adaptor = FlashAttentionAdaptor(torch.device("cpu"))
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+            cache_seqlens_int32=torch.tensor([9], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 9], dtype=torch.int32),
+            max_seq_len_k=9,
+            scheduler_metadata=None,
+        )
+        page_table = metadata.page_table
+        cache_seqlens = metadata.cache_seqlens_int32
+        cu_seqlens = metadata.cu_seqlens_k
+        req_to_token = torch.tensor(
+            [[0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19]], dtype=torch.int64
+        )
+
+        adaptor.save_original_metadata(metadata)
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor([[2, 0]], dtype=torch.int32),
+            valid_lengths=torch.tensor([2], dtype=torch.int32),
+            sparse_mask=torch.tensor([True]),
+            current_metadata=metadata,
+            forward_batch=SimpleNamespace(
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([9], dtype=torch.int64),
+            ),
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=0,
+        )
+        self.assertEqual(metadata.page_table.tolist(), [[4, 0, 2]])
+        self.assertEqual(metadata.cache_seqlens_int32.tolist(), [5])
+
+        # BCG replay refills the same fixed-address metadata buffers with the
+        # next dense batch before the start-layer hook runs again.
+        metadata.page_table.copy_(torch.tensor([[0, 1, 2]], dtype=torch.int32))
+        metadata.cache_seqlens_int32.copy_(torch.tensor([6], dtype=torch.int32))
+        metadata.cu_seqlens_k.copy_(torch.tensor([0, 6], dtype=torch.int32))
+        metadata.max_seq_len_k = 6
+        metadata.scheduler_metadata = torch.ones(1, dtype=torch.int32)
+
+        adaptor.save_original_metadata(metadata)
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor([[1]], dtype=torch.int32),
+            valid_lengths=torch.tensor([1], dtype=torch.int32),
+            sparse_mask=torch.tensor([True]),
+            current_metadata=metadata,
+            forward_batch=SimpleNamespace(
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([6], dtype=torch.int64),
+            ),
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=0,
+        )
+
+        self.assertIs(metadata.page_table, page_table)
+        self.assertIs(metadata.cache_seqlens_int32, cache_seqlens)
+        self.assertIs(metadata.cu_seqlens_k, cu_seqlens)
+        self.assertEqual(metadata.page_table.tolist(), [[2, 1, 2]])
+        self.assertEqual(metadata.cache_seqlens_int32.tolist(), [2])
+        self.assertEqual(metadata.cu_seqlens_k.tolist(), [0, 2])
+        self.assertEqual(metadata.max_seq_len_k, 6)
+        self.assertIsNone(metadata.scheduler_metadata)
 
 
 class TestQuestScoring(unittest.TestCase):

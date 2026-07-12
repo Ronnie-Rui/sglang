@@ -318,22 +318,130 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             raise ValueError(
                 "forward_batch with seq_lens is required for TopK retrieval"
             )
-        seq_lens = seq_lens_source.seq_lens.to(device)
+        seq_lens = seq_lens_source.seq_lens.to(device=device, dtype=torch.long)
+        req_pool_indices = req_pool_indices.to(device=device, dtype=torch.long)
+        sparse_mask = sparse_mask.to(device=device, dtype=torch.bool)
 
+        seq_lens_cpu = self._get_seq_lens_cpu(seq_lens_source, bs)
+        if bs == 1:
+            return self._retrieve_topk_single(
+                queries,
+                layer_id,
+                req_pool_indices,
+                sparse_mask,
+                seq_lens,
+                seq_lens_cpu,
+            )
+
+        return self._retrieve_topk_batched(
+            queries,
+            layer_id,
+            req_pool_indices,
+            sparse_mask,
+            seq_lens,
+            seq_lens_cpu,
+        )
+
+    @staticmethod
+    def _get_seq_lens_cpu(forward_batch, bs: int):
+        """Return the existing host mirror without copying a device tensor."""
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            return None
+
+        if torch.is_tensor(seq_lens_cpu):
+            if seq_lens_cpu.device.type != "cpu" or seq_lens_cpu.numel() != bs:
+                return None
+            values = seq_lens_cpu.reshape(-1).tolist()
+        else:
+            try:
+                values = list(seq_lens_cpu)
+            except TypeError:
+                return None
+            if len(values) != bs:
+                return None
+
+        return [int(seq_len) for seq_len in values]
+
+    def _retrieve_topk_single(
+        self,
+        queries: torch.Tensor,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu,
+    ) -> tuple:
+        """Low-overhead path for the latency-sensitive single-request case."""
+        device = queries.device
+        seq_len = (
+            seq_lens_cpu[0] if seq_lens_cpu is not None else int(seq_lens[0].item())
+        )
+        num_pages = max((seq_len + self.page_size - 1) // self.page_size, 0)
+        if num_pages <= self.num_recent_pages:
+            return self._empty_retrieval(1, device)
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        page_idx = torch.arange(num_pages, device=device, dtype=torch.long)
+        page_starts = (page_idx * self.page_size).clamp(0, req_to_token.shape[1] - 1)
+        phys_pages = (
+            req_to_token[req_pool_indices[0], page_starts].to(torch.long)
+            // self.page_size
+        ).unsqueeze(0)
+        scores = self._retrieve_page_scores(
+            layer_id,
+            phys_pages,
+            req_pool_indices,
+            queries,
+        )
+
+        recent_start = num_pages - self.num_recent_pages
+        k = max(int(recent_start * self.sparsity_ratio), 1)
+        k = min(k, recent_start)
+        topk_scores, topk_idx = torch.topk(
+            scores[:, :recent_start], k=k, dim=1, sorted=False
+        )
+        active = sparse_mask.view(1, 1)
+        topk_valid = active & torch.isfinite(topk_scores)
+
+        recent_idx = torch.arange(
+            recent_start, num_pages, device=device, dtype=torch.long
+        ).unsqueeze(0)
+        recent_valid = active.expand_as(recent_idx)
+
+        return self._finalize_selected_pages(
+            torch.cat([topk_idx.to(torch.long), recent_idx], dim=1),
+            torch.cat([topk_valid, recent_valid], dim=1),
+            num_pages,
+        )
+
+    def _retrieve_topk_batched(
+        self,
+        queries: torch.Tensor,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu,
+    ) -> tuple:
+        """Vectorized retrieval for batches, including ragged sequence lengths."""
+        bs, device = queries.shape[0], queries.device
         req_to_token = self.req_to_token_pool.req_to_token
         max_req_tokens = req_to_token.shape[1]
 
-        req_pool_indices = req_pool_indices.to(device=device, dtype=torch.long)
-        sparse_mask = sparse_mask.to(device=device, dtype=torch.bool)
-        seq_lens = seq_lens.to(dtype=torch.long)
-
         num_pages = (seq_lens + self.page_size - 1) // self.page_size
-        max_num_pages = int(num_pages.max().item()) if bs > 0 else 0
+        if seq_lens_cpu is not None:
+            num_pages_cpu = [
+                max((seq_len + self.page_size - 1) // self.page_size, 0)
+                for seq_len in seq_lens_cpu
+            ]
+            max_num_pages = max(num_pages_cpu, default=0)
+        else:
+            num_pages_cpu = None
+            max_num_pages = int(num_pages.max().item()) if bs > 0 else 0
+
         if max_num_pages <= self.num_recent_pages:
-            return (
-                torch.full((bs, 1), -1, dtype=torch.int32, device=device),
-                torch.zeros(bs, dtype=torch.int32, device=device),
-            )
+            return self._empty_retrieval(bs, device)
 
         page_idx = torch.arange(max_num_pages, device=device, dtype=torch.long)
         valid_page_mask = page_idx.unsqueeze(0) < num_pages.unsqueeze(1)
@@ -365,42 +473,74 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         k_per_req = torch.minimum(k_per_req, history_pages)
         k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
 
-        max_k = int(k_per_req.max().item())
-        if max_k <= 0:
-            return (
-                torch.full((bs, 1), -1, dtype=torch.int32, device=device),
-                torch.zeros(bs, dtype=torch.int32, device=device),
-            )
+        if num_pages_cpu is not None:
+            k_per_req_cpu = []
+            for count in num_pages_cpu:
+                if count <= self.num_recent_pages:
+                    k_per_req_cpu.append(0)
+                    continue
+                history_count = count - self.num_recent_pages
+                k_per_req_cpu.append(
+                    min(max(int(history_count * self.sparsity_ratio), 1), history_count)
+                )
+            max_k = max(k_per_req_cpu, default=0)
+            positive_k = {k for k in k_per_req_cpu if k > 0}
+            score_order_required = len(positive_k) > 1
+        else:
+            max_k = int(k_per_req.max().item())
+            # Without host metadata, avoid another device synchronization just
+            # to determine whether all active rows have the same k.
+            score_order_required = True
 
-        topk_idx = torch.topk(scores, k=max_k, dim=1, sorted=True)[1].to(torch.long)
+        if max_k <= 0:
+            return self._empty_retrieval(bs, device)
+
+        topk_scores, topk_idx = torch.topk(
+            scores, k=max_k, dim=1, sorted=score_order_required
+        )
+        topk_idx = topk_idx.to(torch.long)
         topk_rank = torch.arange(max_k, device=device, dtype=torch.long)
-        topk_valid = topk_rank.unsqueeze(0) < k_per_req.unsqueeze(1)
+        topk_valid = (topk_rank.unsqueeze(0) < k_per_req.unsqueeze(1)) & torch.isfinite(
+            topk_scores
+        )
 
         recent_offsets = torch.arange(
             self.num_recent_pages, device=device, dtype=torch.long
         )
         recent_idx = recent_start.unsqueeze(1) + recent_offsets.unsqueeze(0)
         recent_valid = active_mask.unsqueeze(1) & (recent_idx < num_pages.unsqueeze(1))
-        recent_lengths = recent_valid.sum(dim=1).to(torch.long)
 
         combined_idx = torch.cat([topk_idx, recent_idx], dim=1)
         combined_valid = torch.cat([topk_valid, recent_valid], dim=1)
-        selected_lengths = k_per_req + recent_lengths
 
-        max_selected = int(selected_lengths.max().item())
-        out_len = max(max_selected, 1)
-        sentinel = max_num_pages
+        return self._finalize_selected_pages(
+            combined_idx, combined_valid, max_num_pages
+        )
+
+    @staticmethod
+    def _empty_retrieval(bs: int, device: torch.device) -> tuple:
+        return (
+            torch.full((bs, 1), -1, dtype=torch.int32, device=device),
+            torch.zeros(bs, dtype=torch.int32, device=device),
+        )
+
+    @staticmethod
+    def _finalize_selected_pages(
+        combined_idx: torch.Tensor,
+        combined_valid: torch.Tensor,
+        sentinel: int,
+    ) -> tuple:
+        """Compact valid logical pages, sort them, and leave a -1 suffix."""
         sortable_idx = torch.where(
             combined_valid, combined_idx, torch.full_like(combined_idx, sentinel)
         )
-        sorted_idx = torch.sort(sortable_idx, dim=1)[0][:, :out_len].to(torch.int32)
+        sorted_idx = torch.sort(sortable_idx, dim=1)[0].to(torch.int32)
         out_indices = torch.where(
             sorted_idx == sentinel,
             torch.full_like(sorted_idx, -1),
             sorted_idx,
         )
-        out_lengths = selected_lengths.to(torch.int32)
-
+        out_lengths = combined_valid.sum(dim=1).to(torch.int32)
         return out_indices, out_lengths
 
     def _initialize_representation_pools(

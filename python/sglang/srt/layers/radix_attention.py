@@ -199,6 +199,7 @@ class RadixAttention(nn.Module):
                 sparse_forward = (
                     breakable_sparse_attention_forward
                     if is_in_breakable_cuda_graph()
+                    and not forward_batch.forward_mode.is_decode()
                     else sparse_attention_forward
                 )
                 return sparse_forward(
@@ -300,27 +301,106 @@ def sparse_attention_forward(
     # attention metadata rewrites. Extend/prefill reaches this helper only to
     # let attention_end construct or update page representations after dense FA.
     if forward_batch.forward_mode.is_decode():
-        new_metadata = runtime_sparse_coordinator.attention_begin(
-            q,
-            k,
-            v,
-            layer,
-            forward_batch,
-            getattr(attn_backend, "forward_metadata", None),
-            **kwargs,
+        attention_begin = (
+            breakable_sparse_attention_begin
+            if is_in_breakable_cuda_graph()
+            else sparse_attention_begin
         )
-        if new_metadata is not None:
-            attn_backend.forward_metadata = new_metadata
+        attention_begin(q, k, v, layer, forward_batch, **kwargs)
 
     output = _dense_attention_forward(
         attn_backend, q, k, v, layer, forward_batch, save_kv_cache, **kwargs
     )
-    runtime_sparse_coordinator.attention_end(output, layer, forward_batch)
+    # A BCG replay does not execute this Python body. Decode representation
+    # updates are therefore scheduled once after replay by SparseCoordinator.forward_end.
+    # Eager decode and extend/prefill retain their existing per-layer behavior.
+    if not (
+        forward_batch.forward_mode.is_decode() and is_in_breakable_cuda_graph()
+    ):
+        runtime_sparse_coordinator.attention_end(output, layer, forward_batch)
     return output
 
 
-# In breakable CUDA Graph mode, force Quest retrieval and metadata rewriting to
-# run eagerly at graph breaks while the surrounding decode work stays captured.
+# Metadata tensors consumed by a captured FA kernel must keep the exact addresses
+# seen at capture. The adaptor may rewrite their contents, but never replace them.
+_BCG_STABLE_METADATA_FIELDS = (
+    "page_table",
+    "cache_seqlens_int32",
+    "cu_seqlens_q",
+    "cu_seqlens_k",
+    "scheduler_metadata",
+)
+
+
+def _metadata_tensor_addresses(metadata) -> tuple:
+    if metadata is None:
+        return ()
+    return tuple(
+        (
+            name,
+            value.data_ptr() if torch.is_tensor(value) else None,
+        )
+        for name in _BCG_STABLE_METADATA_FIELDS
+        if hasattr(metadata, name)
+        for value in (getattr(metadata, name),)
+    )
+
+
+def sparse_attention_begin(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    **kwargs,
+) -> None:
+    """Run query-dependent retrieval and rewrite FA metadata in place."""
+    context = get_forward_context()
+    attn_backend = context.attn_backend
+    runtime_sparse_coordinator = context.runtime_sparse_coordinator
+    current_metadata = getattr(attn_backend, "forward_metadata", None)
+    in_breakable_graph = is_in_breakable_cuda_graph()
+    captured_addresses = (
+        _metadata_tensor_addresses(current_metadata) if in_breakable_graph else ()
+    )
+
+    new_metadata = runtime_sparse_coordinator.attention_begin(
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        current_metadata,
+        **kwargs,
+    )
+    if new_metadata is None:
+        return
+
+    if in_breakable_graph:
+        if new_metadata is not current_metadata:
+            raise RuntimeError(
+                "Breakable CUDA Graph sparse attention must rewrite forward "
+                "metadata in place; replacing the metadata object invalidates "
+                "captured FA tensor addresses."
+            )
+        updated_addresses = _metadata_tensor_addresses(new_metadata)
+        if updated_addresses != captured_addresses:
+            raise RuntimeError(
+                "Breakable CUDA Graph sparse attention replaced one or more "
+                "forward metadata tensors; captured FA tensor addresses must "
+                "remain stable."
+            )
+
+    attn_backend.forward_metadata = new_metadata
+
+
+# Decode only breaks around retrieval/metadata mutation. The helper returns None,
+# so eager_on_graph has no attention output to copy between graph segments.
+breakable_sparse_attention_begin = eager_on_graph(True)(sparse_attention_begin)
+
+
+# Extend/prefill still needs representation construction after each attention and
+# keeps the legacy whole-forward eager boundary until that lifecycle is migrated.
 breakable_sparse_attention_forward = eager_on_graph(True)(sparse_attention_forward)
 
 

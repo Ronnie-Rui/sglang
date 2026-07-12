@@ -48,8 +48,9 @@ class _FakeStates:
 
 
 class _FakeForwardBatch:
-    def __init__(self, seq_lens):
+    def __init__(self, seq_lens, seq_lens_cpu=True):
         self.seq_lens = seq_lens
+        self.seq_lens_cpu = seq_lens.cpu() if seq_lens_cpu else None
 
 
 def _build_req_to_token(batch_size, seq_lens, page_size, device):
@@ -185,6 +186,7 @@ class TestQuestRetrieveTopkEquivalence(CustomTestCase):
         head_dim=8,
         sparse_mask_list=None,
         seed=0,
+        use_seq_lens_cpu=True,
     ):
         device = self.device
         batch_size = len(seq_lens_list)
@@ -212,7 +214,7 @@ class TestQuestRetrieveTopkEquivalence(CustomTestCase):
             sparse_mask = torch.tensor(
                 sparse_mask_list, dtype=torch.bool, device=device
             )
-        forward_batch = _FakeForwardBatch(seq_lens)
+        forward_batch = _FakeForwardBatch(seq_lens, use_seq_lens_cpu)
 
         opt_indices, opt_lengths = algo.retrieve_topk(
             queries,
@@ -237,12 +239,19 @@ class TestQuestRetrieveTopkEquivalence(CustomTestCase):
             ref_rows,
             msg=f"selected pages mismatch for seq_lens={seq_lens_list}",
         )
+        for row, length in zip(opt_indices.tolist(), opt_lengths.tolist()):
+            self.assertEqual(row[:length], sorted(row[:length]))
+            self.assertTrue(all(page >= 0 for page in row[:length]))
+            self.assertTrue(all(page == -1 for page in row[length:]))
 
     def test_uniform_aligned(self):
         self._run_case([512, 512, 512, 512])
 
     def test_ragged_unaligned(self):
         self._run_case([511, 333, 257, 129])
+
+    def test_ragged_unaligned_without_cpu_mirror(self):
+        self._run_case([511, 333, 257, 129], use_seq_lens_cpu=False)
 
     def test_mixed_sparse_mask(self):
         self._run_case(
@@ -263,8 +272,78 @@ class TestQuestRetrieveTopkEquivalence(CustomTestCase):
     def test_batch_size_one(self):
         self._run_case([777])
 
+    def test_batch_size_one_without_cpu_mirror(self):
+        self._run_case([777], use_seq_lens_cpu=False)
+
+    def test_batch_size_one_inactive_has_only_padding(self):
+        self._run_case([777], sparse_mask_list=[False])
+
     def test_different_page_size(self):
         self._run_case([1024, 800, 640], page_size=32)
+
+    def test_ragged_k_selects_each_rows_actual_topk(self):
+        seq_lens = torch.tensor([9, 5], dtype=torch.int64, device=self.device)
+        algo, _ = _make_algorithm(
+            batch_size=2,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+        )
+        scores = torch.tensor(
+            [
+                [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 100.0],
+                [100.0, 1.0, 99.0, 98.0, 97.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            device=self.device,
+        )
+
+        def retrieve_scores(layer_id, phys_pages, req_pool_indices, queries):
+            return scores[:, : phys_pages.shape[1]]
+
+        algo._retrieve_page_scores = retrieve_scores
+        indices, lengths = algo.retrieve_topk(
+            queries=torch.zeros((2, 1, 1), device=self.device),
+            layer_id=0,
+            req_pool_indices=torch.arange(2, device=self.device),
+            sparse_mask=torch.ones(2, dtype=torch.bool, device=self.device),
+            forward_batch=_FakeForwardBatch(seq_lens),
+        )
+
+        self.assertEqual(lengths.tolist(), [5, 3])
+        self.assertEqual(indices[0].tolist(), [4, 5, 6, 7, 8])
+        self.assertEqual(indices[1].tolist(), [0, 2, 4, -1, -1])
+
+    def test_invalid_history_pages_are_excluded(self):
+        seq_lens = torch.tensor([8], dtype=torch.int64, device=self.device)
+        algo, _ = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.75,
+            num_recent_pages=2,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+        )
+        algo.page_valid[0].zero_()
+        algo.page_valid[0][torch.tensor([1, 4], device=self.device)] = True
+
+        indices, lengths = algo.retrieve_topk(
+            queries=torch.zeros((1, 1, 1), device=self.device),
+            layer_id=0,
+            req_pool_indices=torch.zeros(1, dtype=torch.long, device=self.device),
+            sparse_mask=torch.ones(1, dtype=torch.bool, device=self.device),
+            forward_batch=_FakeForwardBatch(seq_lens),
+        )
+
+        self.assertEqual(lengths.tolist(), [4])
+        self.assertEqual(indices[0].tolist(), [1, 4, 6, 7, -1, -1])
 
 
 def _reference_compute_page_reps_masked(

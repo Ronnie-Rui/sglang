@@ -3110,6 +3110,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+                if self.runtime_sparse_coordinator is not None:
+                    self.runtime_sparse_coordinator.forward_end(forward_batch)
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode

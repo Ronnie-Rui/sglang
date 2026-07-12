@@ -173,12 +173,26 @@ class SparseCoordinator:
         """
         Handle forward pass end event. Called after each forward pass completes.
 
-        Trigger async KVCache offloading operations.
+        Update decode representations after a captured model replay. Scheduling
+        this once per forward keeps the per-layer BCG break limited to retrieval
+        and metadata mutation while preserving KV-write-before-update ordering.
         """
-        # TODO: Implement forward end handling
-        # - Identify tokens to offload
-        # - Trigger async offloading operations
-        pass
+        if not forward_batch.forward_mode.is_decode():
+            return
+
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        if req_pool_indices is None or seq_lens is None:
+            return
+
+        for layer_id in range(self.start_layer, self.end_layer):
+            self.algorithm.update_representations(
+                layer_id=layer_id,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
+                forward_batch=forward_batch,
+            )
 
     def attention_begin(
         self,
