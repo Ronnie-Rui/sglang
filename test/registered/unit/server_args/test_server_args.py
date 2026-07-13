@@ -429,6 +429,80 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "num_recent_pages"):
             parse_runtime_sparse_config(server_args)
 
+    def test_quest_runtime_accepts_max_selected_tokens(self):
+        for max_selected_tokens in (80, 1024, None):
+            with self.subTest(max_selected_tokens=max_selected_tokens):
+                hisparse_config = {
+                    "algorithm": "quest",
+                    "backend": "fa3",
+                    "page_size": 16,
+                    "num_recent_pages": 4,
+                    "quest_max_selected_tokens": max_selected_tokens,
+                }
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=json.dumps(hisparse_config),
+                )
+
+                config = parse_runtime_sparse_config(server_args)
+
+                self.assertEqual(
+                    config.sparse_extra_config["quest_max_selected_tokens"],
+                    max_selected_tokens,
+                )
+
+    def test_quest_runtime_top_k_does_not_enable_max_selected_tokens(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            attention_backend="fa3",
+            page_size=16,
+            hisparse_config=(
+                '{"algorithm":"quest","backend":"fa3","page_size":16,' '"top_k":80}'
+            ),
+        )
+
+        config = parse_runtime_sparse_config(server_args)
+
+        self.assertEqual(config.top_k, 80)
+        self.assertNotIn("quest_max_selected_tokens", config.sparse_extra_config)
+
+    def test_quest_runtime_rejects_invalid_max_selected_tokens(self):
+        invalid_cases = (
+            (True, "positive integer or null"),
+            (80.0, "positive integer or null"),
+            ("80", "positive integer or null"),
+            (0, "positive integer or null"),
+            (-16, "positive integer or null"),
+            (81, "multiple of page_size"),
+            (64, "all recent pages and at least one history page"),
+        )
+        for max_selected_tokens, error_pattern in invalid_cases:
+            with self.subTest(max_selected_tokens=max_selected_tokens):
+                hisparse_config = {
+                    "algorithm": "quest",
+                    "backend": "fa3",
+                    "page_size": 16,
+                    "num_recent_pages": 4,
+                    "quest_max_selected_tokens": max_selected_tokens,
+                }
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=json.dumps(hisparse_config),
+                )
+
+                with self.assertRaisesRegex(ValueError, error_pattern):
+                    parse_runtime_sparse_config(server_args)
+
     def test_quest_runtime_validates_layer_selection_reuse_interval(self):
         for invalid_value in ("0", "true", "1.5"):
             with self.subTest(invalid_value=invalid_value):
@@ -551,8 +625,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             attention_backend="fa3",
             page_size=16,
             hisparse_config=(
-                '{"algorithm":"quest","backend":"fa3","page_size":16,'
-                f"{extra_config}}}"
+                f'{{"algorithm":"quest","backend":"fa3","page_size":16,{extra_config}}}'
             ),
         )
 

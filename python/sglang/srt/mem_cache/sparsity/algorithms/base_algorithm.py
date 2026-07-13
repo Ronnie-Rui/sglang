@@ -92,6 +92,10 @@ class BaseSparseAlgorithm(ABC):
         """Return the history-page keep ratio for one attention layer."""
         return self.sparsity_ratio
 
+    def get_history_page_selection_cap(self) -> int | None:
+        """Return a process-wide hard cap for selected history pages."""
+        return None
+
     def should_update_metadata_lengths(self, layer_id: int) -> bool:
         """Return whether this layer changes sparse sequence lengths."""
         return layer_id == getattr(self, "start_layer", layer_id)
@@ -605,25 +609,29 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         ratio: float,
     ) -> tuple[torch.Tensor, int, bool]:
         """Build the dynamic per-request k and its static output-width bound."""
+        history_page_cap = self.get_history_page_selection_cap()
+        if history_page_cap is not None:
+            history_page_cap = min(history_page_cap, max_num_pages)
         history_pages = recent_start.clamp(min=1)
         k_per_req = (history_pages.to(torch.float32) * ratio).to(torch.long)
         k_per_req = torch.maximum(k_per_req, torch.ones_like(k_per_req))
         k_per_req = torch.minimum(k_per_req, history_pages)
+        if history_page_cap is not None:
+            k_per_req = torch.clamp(k_per_req, max=history_page_cap)
         k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
+
+        def selection_count(history_count: int) -> int:
+            count = min(
+                max(_float32_scaled_count(history_count, ratio), 1),
+                history_count,
+            )
+            return (
+                min(count, history_page_cap) if history_page_cap is not None else count
+            )
 
         if fixed_capacity:
             history_capacity = max(max_num_pages - self.num_recent_pages, 0)
-            max_k = (
-                min(
-                    max(
-                        _float32_scaled_count(history_capacity, ratio),
-                        1,
-                    ),
-                    history_capacity,
-                )
-                if history_capacity > 0
-                else 0
-            )
+            max_k = selection_count(history_capacity) if history_capacity > 0 else 0
             score_order_required = True
         elif num_pages_cpu is not None:
             k_per_req_cpu = []
@@ -632,15 +640,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
                     k_per_req_cpu.append(0)
                     continue
                 history_count = count - self.num_recent_pages
-                k_per_req_cpu.append(
-                    min(
-                        max(
-                            _float32_scaled_count(history_count, ratio),
-                            1,
-                        ),
-                        history_count,
-                    )
-                )
+                k_per_req_cpu.append(selection_count(history_count))
             max_k = max(k_per_req_cpu, default=0)
             positive_k = {k for k in k_per_req_cpu if k > 0}
             score_order_required = len(positive_k) > 1

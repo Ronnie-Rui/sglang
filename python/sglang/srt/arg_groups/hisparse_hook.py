@@ -21,6 +21,7 @@ RUNTIME_SPARSE_BACKENDS_BY_ALGORITHM = {
 RUNTIME_SPARSE_ALGORITHMS = set(RUNTIME_SPARSE_BACKENDS_BY_ALGORITHM)
 RUNTIME_SPARSE_ATTENTION_BACKEND_ALIASES = {"flashattention": "fa3"}
 QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION = "use_native_page_bounds_dtype"
+QUEST_MAX_SELECTED_TOKENS_OPTION = "quest_max_selected_tokens"
 
 
 def _load_hisparse_config(server_args: ServerArgs) -> dict:

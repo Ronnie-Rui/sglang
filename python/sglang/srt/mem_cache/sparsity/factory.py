@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.arg_groups.hisparse_hook import (
+    QUEST_MAX_SELECTED_TOKENS_OPTION,
     QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION,
 )
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
@@ -195,6 +196,35 @@ def parse_runtime_sparse_config(server_args) -> SparseConfig:
             "Sparse runtime config num_recent_pages must be a positive integer, "
             f"got {num_recent_pages!r}."
         )
+
+    quest_max_selected_tokens = config.sparse_extra_config.get(
+        QUEST_MAX_SELECTED_TOKENS_OPTION
+    )
+    if quest_max_selected_tokens is not None:
+        if (
+            not isinstance(quest_max_selected_tokens, int)
+            or isinstance(quest_max_selected_tokens, bool)
+            or quest_max_selected_tokens <= 0
+        ):
+            raise ValueError(
+                "Sparse runtime config quest_max_selected_tokens must be a "
+                "positive integer or null, "
+                f"got {quest_max_selected_tokens!r}."
+            )
+        if quest_max_selected_tokens % config.page_size != 0:
+            raise ValueError(
+                "Sparse runtime config quest_max_selected_tokens must be a "
+                f"multiple of page_size ({config.page_size}), "
+                f"got {quest_max_selected_tokens}."
+            )
+        effective_recent_pages = num_recent_pages if num_recent_pages is not None else 4
+        minimum_selected_tokens = (effective_recent_pages + 1) * config.page_size
+        if quest_max_selected_tokens < minimum_selected_tokens:
+            raise ValueError(
+                "Sparse runtime config quest_max_selected_tokens must include "
+                "all recent pages and at least one history page; expected at "
+                f"least {minimum_selected_tokens}, got {quest_max_selected_tokens}."
+            )
 
     layer_selection_reuse_interval = config.sparse_extra_config.get(
         "layer_selection_reuse_interval"

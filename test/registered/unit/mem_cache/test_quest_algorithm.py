@@ -157,6 +157,9 @@ def _reference_retrieve_topk(
         history_pages = max(recent_start, 1)
         k = max(int(history_pages * algo.sparsity_ratio), 1)
         k = min(k, history_pages)
+        history_page_cap = algo.get_history_page_selection_cap()
+        if history_page_cap is not None:
+            k = min(k, history_page_cap)
         topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1].squeeze(0)
         recent_idx = torch.arange(
             recent_start, recent_start + algo.num_recent_pages, device=device
@@ -568,6 +571,270 @@ class TestQuestRetrieveTopkEquivalence(CustomTestCase):
         self.assertEqual(plan.k_per_req.tolist(), [279])
         self.assertEqual(plan.max_k, 279)
         self.assertLessEqual(plan.k_per_req.max().item(), plan.max_k)
+
+
+class TestQuestFixedSelectionBudget(CustomTestCase):
+    device = torch.device("cpu")
+
+    def _make_plan(
+        self,
+        seq_lens_list,
+        *,
+        cap_tokens=1024,
+        page_size=16,
+        ratio=0.5,
+        recent_pages=4,
+        sparse_mask=None,
+        use_seq_lens_cpu=True,
+        fixed_capacity=False,
+        layer_page_budget=None,
+    ):
+        seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64, device=self.device)
+        algorithm, k_buffer = _make_algorithm(
+            batch_size=len(seq_lens_list),
+            seq_lens=seq_lens,
+            page_size=page_size,
+            sparsity_ratio=ratio,
+            num_recent_pages=recent_pages,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=41,
+            sparse_extra_config={
+                "quest_max_selected_tokens": cap_tokens,
+                "layer_page_budget": layer_page_budget or [],
+            },
+            end_layer=3 if layer_page_budget else 1,
+        )
+        req_pool_indices = torch.arange(
+            len(seq_lens_list), dtype=torch.int64, device=self.device
+        )
+        if sparse_mask is None:
+            sparse_mask = torch.ones(
+                len(seq_lens_list), dtype=torch.bool, device=self.device
+            )
+        else:
+            sparse_mask = torch.tensor(
+                sparse_mask, dtype=torch.bool, device=self.device
+            )
+        forward_batch = _FakeForwardBatch(seq_lens, use_seq_lens_cpu)
+        algorithm.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            self.device,
+            fixed_capacity=fixed_capacity,
+        )
+        return (
+            algorithm,
+            k_buffer,
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+        )
+
+    def test_cap_is_default_off_and_generic_top_k_does_not_enable_it(self):
+        config = _Config(page_size=16, sparsity_ratio=0.5, num_recent_pages=4)
+        config.top_k = 80
+        algorithm = QuestAlgorithm(config, self.device)
+
+        self.assertIsNone(algorithm.quest_max_selected_pages)
+        self.assertIsNone(algorithm.get_history_page_selection_cap())
+
+    def test_ragged_budget_caps_total_width_and_preserves_inactive_rows(self):
+        (
+            algorithm,
+            k_buffer,
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+        ) = self._make_plan(
+            [4096, 2048, 512],
+            sparse_mask=[True, False, True],
+        )
+        plan = algorithm._retrieval_plan
+
+        self.assertEqual(algorithm.quest_max_selected_pages, 64)
+        self.assertEqual(algorithm.get_history_page_selection_cap(), 60)
+        self.assertEqual(plan.k_per_req.tolist(), [60, 0, 14])
+        self.assertEqual(plan.max_k, 60)
+
+        _populate_page_reps(
+            algorithm,
+            batch_size=3,
+            seq_lens=forward_batch.seq_lens,
+            k_buffer=k_buffer,
+            device=self.device,
+        )
+        selected, lengths = algorithm.retrieve_topk(
+            torch.zeros((3, 1, 1), device=self.device),
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )
+
+        self.assertEqual(selected.shape, (3, 64))
+        self.assertEqual(lengths.tolist(), [64, 0, 18])
+        self.assertTrue(torch.all(lengths <= 64).item())
+        self.assertTrue(torch.all(selected[1] == -1).item())
+
+    def test_nonbinding_budget_is_exactly_equivalent_to_default(self):
+        seq_lens = torch.tensor([512, 384], dtype=torch.int64, device=self.device)
+        common = dict(
+            batch_size=2,
+            seq_lens=seq_lens,
+            page_size=16,
+            sparsity_ratio=0.5,
+            num_recent_pages=4,
+            kv_heads=1,
+            head_dim=4,
+            device=self.device,
+            seed=57,
+        )
+        default, default_k = _make_algorithm(**common)
+        capped, capped_k = _make_algorithm(
+            **common,
+            sparse_extra_config={"quest_max_selected_tokens": 1024},
+        )
+        self.assertTrue(torch.equal(default_k, capped_k))
+        for algorithm, k_buffer in ((default, default_k), (capped, capped_k)):
+            _populate_page_reps(algorithm, 2, seq_lens, k_buffer, self.device)
+
+        req_pool_indices = torch.arange(2, dtype=torch.int64, device=self.device)
+        sparse_mask = torch.ones(2, dtype=torch.bool, device=self.device)
+        forward_batch = _FakeForwardBatch(seq_lens)
+        torch.manual_seed(59)
+        queries = torch.randn((2, 2, 4), device=self.device)
+        default.begin_forward(forward_batch, req_pool_indices, sparse_mask, self.device)
+        capped.begin_forward(forward_batch, req_pool_indices, sparse_mask, self.device)
+
+        default_result = default.retrieve_topk(
+            queries,
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )
+        capped_result = capped.retrieve_topk(
+            queries,
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )
+
+        self.assertTrue(torch.equal(default_result[0], capped_result[0]))
+        self.assertTrue(torch.equal(default_result[1], capped_result[1]))
+
+    def test_device_only_plan_uses_the_same_cap(self):
+        algorithm, _, _, _, _ = self._make_plan(
+            [4096, 2048, 512],
+            use_seq_lens_cpu=False,
+        )
+        plan = algorithm._retrieval_plan
+
+        self.assertIsNone(plan.num_pages_cpu)
+        self.assertEqual(plan.k_per_req.tolist(), [60, 60, 14])
+        self.assertEqual(plan.max_k, 60)
+
+    def test_extremely_large_cap_is_nonbinding_without_int64_overflow(self):
+        cap_pages = (1 << 63) + 4
+        algorithm, _, _, _, _ = self._make_plan(
+            [512],
+            cap_tokens=cap_pages * 16,
+        )
+        plan = algorithm._retrieval_plan
+
+        self.assertEqual(algorithm.quest_max_selected_pages, cap_pages)
+        self.assertEqual(plan.k_per_req.tolist(), [14])
+        self.assertEqual(plan.max_k, 14)
+
+    def test_partial_last_page_stays_below_the_token_cap(self):
+        (
+            algorithm,
+            k_buffer,
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+        ) = self._make_plan(
+            [32001],
+            cap_tokens=2048,
+        )
+        _populate_page_reps(
+            algorithm,
+            batch_size=1,
+            seq_lens=forward_batch.seq_lens,
+            k_buffer=k_buffer,
+            device=self.device,
+        )
+
+        _, valid_lengths = algorithm.retrieve_topk(
+            torch.zeros((1, 1, 1), device=self.device),
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )
+        last_page_tokens = (forward_batch.seq_lens - 1) % algorithm.page_size + 1
+        selected_tokens = (
+            valid_lengths.to(torch.int64) - 1
+        ) * algorithm.page_size + last_page_tokens
+
+        self.assertEqual(valid_lengths.tolist(), [128])
+        self.assertEqual(selected_tokens.tolist(), [2033])
+        self.assertTrue(torch.all(selected_tokens <= 2048).item())
+
+    def test_fixed_capacity_caps_device_k_and_static_output_width(self):
+        algorithm, _, _, _, _ = self._make_plan(
+            [8192],
+            cap_tokens=2048,
+            page_size=1,
+            ratio=0.7,
+            fixed_capacity=8192,
+        )
+        algorithm.device = "cuda"
+        # Rebuild after using the production string device representation so
+        # the JIT eligibility branch is covered without requiring a GPU.
+        forward_batch = _FakeForwardBatch(torch.tensor([8192], dtype=torch.int64))
+        req_pool_indices = torch.zeros(1, dtype=torch.int64)
+        sparse_mask = torch.ones(1, dtype=torch.bool)
+        algorithm.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            self.device,
+            fixed_capacity=8192,
+        )
+        plan = algorithm._retrieval_plan
+
+        self.assertEqual(plan.k_per_req.dtype, torch.int32)
+        self.assertEqual(plan.k_per_req.tolist(), [2044])
+        self.assertEqual(plan.max_k, 2044)
+        self.assertEqual(plan.max_k + algorithm.num_recent_pages, 2048)
+
+    def test_layer_ratio_is_applied_before_the_global_hard_cap(self):
+        algorithm, _, _, _, _ = self._make_plan(
+            [4096],
+            layer_page_budget=[
+                {"start_layer": 1, "end_layer": 2, "scale": 0.5},
+                {"start_layer": 2, "end_layer": 3, "scale": 0.25},
+            ],
+        )
+        base_plan = algorithm._retrieval_plan
+        half_plan = algorithm._get_retrieval_plan_for_ratio(
+            base_plan, algorithm.get_layer_sparsity_ratio(1)
+        )
+        quarter_plan = algorithm._get_retrieval_plan_for_ratio(
+            base_plan, algorithm.get_layer_sparsity_ratio(2)
+        )
+
+        self.assertEqual(base_plan.k_per_req.tolist(), [60])
+        self.assertEqual(half_plan.k_per_req.tolist(), [60])
+        self.assertEqual(quarter_plan.k_per_req.tolist(), [31])
+        self.assertEqual(
+            [base_plan.max_k, half_plan.max_k, quarter_plan.max_k], [60, 60, 31]
+        )
 
 
 class TestQuestLayerReuseAndBudget(unittest.TestCase):

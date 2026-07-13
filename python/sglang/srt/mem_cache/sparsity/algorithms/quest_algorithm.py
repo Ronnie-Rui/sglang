@@ -12,6 +12,7 @@ import logging
 import torch
 
 from sglang.srt.arg_groups.hisparse_hook import (
+    QUEST_MAX_SELECTED_TOKENS_OPTION,
     QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION,
     resolve_quest_page_bounds_dtype,
 )
@@ -53,6 +54,14 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         )
         self.use_native_page_bounds_dtype = config.sparse_extra_config.get(
             QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION, False
+        )
+        quest_max_selected_tokens = config.sparse_extra_config.get(
+            QUEST_MAX_SELECTED_TOKENS_OPTION
+        )
+        self.quest_max_selected_pages = (
+            None
+            if quest_max_selected_tokens is None
+            else quest_max_selected_tokens // self.page_size
         )
         self.layer_selection_reuse_interval = config.sparse_extra_config.get(
             "layer_selection_reuse_interval", 1
@@ -125,6 +134,11 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
 
     def get_layer_sparsity_ratio(self, layer_id: int) -> float:
         return self.sparsity_ratio * self._get_layer_budget_scale(layer_id)
+
+    def get_history_page_selection_cap(self) -> int | None:
+        if self.quest_max_selected_pages is None:
+            return None
+        return self.quest_max_selected_pages - self.num_recent_pages
 
     def _selection_group(self, layer_id: int) -> tuple[int, float]:
         local_layer_id = layer_id - self.start_layer

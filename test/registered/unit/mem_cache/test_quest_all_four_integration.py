@@ -191,9 +191,11 @@ class TestQuestAllFourIntegration(unittest.TestCase):
 
         device = torch.device("cuda", torch.cuda.current_device())
         page_size = 4
-        # The first row produces a full-budget top-k width of 255 and a
-        # [4, 24) budget width of 191. This exercises realistic non-trivial
-        # fused-kernel widths while retaining ragged rows and an inactive row.
+        max_selected_tokens = 800
+        max_selected_pages = max_selected_tokens // page_size
+        # The first row would produce a full-budget history width of 255, so
+        # the fixed token budget caps it at 198 history plus 2 recent pages.
+        # The [4, 24) layer budget remains narrower at 191 history pages.
         seq_lens = torch.tensor([2564, 2308, 2052], device=device)
         req_to_token, key_buffer = _build_storage(
             seq_lens, page_size, device, seed=317, dtype=torch.float16
@@ -208,13 +210,17 @@ class TestQuestAllFourIntegration(unittest.TestCase):
         )
         actual = _make_algorithm(
             **common,
-            extra_config=_all_four_config(use_native_page_bounds_dtype=True),
+            extra_config={
+                **_all_four_config(use_native_page_bounds_dtype=True),
+                "quest_max_selected_tokens": max_selected_tokens,
+            },
         )
         reference = _make_algorithm(
             **common,
             extra_config={
                 "layer_selection_reuse_interval": 2,
                 "layer_page_budget": _BUDGET,
+                "quest_max_selected_tokens": max_selected_tokens,
             },
         )
         self.assertEqual(actual.page_k_min[0].dtype, torch.float16)
@@ -238,6 +244,13 @@ class TestQuestAllFourIntegration(unittest.TestCase):
         actual.begin_forward(forward_batch, req_pool_indices, sparse_mask, device)
         reference.begin_forward(forward_batch, req_pool_indices, sparse_mask, device)
         full_width = actual._retrieval_plan.max_k + actual.num_recent_pages
+        self.assertEqual(actual.quest_max_selected_pages, max_selected_pages)
+        self.assertEqual(reference.quest_max_selected_pages, max_selected_pages)
+        self.assertEqual(full_width, max_selected_pages)
+        self.assertEqual(
+            reference._retrieval_plan.max_k + reference.num_recent_pages,
+            max_selected_pages,
+        )
         metadata = _make_metadata(3, full_width, device)
         metadata_ptrs = (
             metadata.page_table.data_ptr(),
@@ -292,6 +305,12 @@ class TestQuestAllFourIntegration(unittest.TestCase):
                 self.assertEqual(
                     _selected_rows(actual_pages, actual_lengths),
                     _selected_rows(reference_pages, reference_lengths),
+                )
+                self.assertLessEqual(actual_pages.shape[1], max_selected_pages)
+                self.assertLessEqual(reference_pages.shape[1], max_selected_pages)
+                self.assertTrue(torch.all(actual_lengths <= max_selected_pages).item())
+                self.assertTrue(
+                    torch.all(reference_lengths <= max_selected_pages).item()
                 )
                 self.assertEqual(actual_lengths[1].item(), 0)
                 expected_cache_seqlens, expected_cu_seqlens = _expected_fa_lengths(
@@ -394,7 +413,10 @@ class TestQuestAllFourIntegration(unittest.TestCase):
 
         device = torch.device("cuda", torch.cuda.current_device())
         page_size = 4
-        seq_lens = torch.tensor([252, 228, 196], device=device)
+        max_selected_tokens = 64
+        max_selected_pages = max_selected_tokens // page_size
+        graph_capacity_pages = 48
+        seq_lens = torch.tensor([192, 168, 144], device=device)
         req_to_token, key_buffer = _build_storage(seq_lens, page_size, device, seed=419)
         algorithm = _make_algorithm(
             seq_lens=seq_lens,
@@ -403,7 +425,10 @@ class TestQuestAllFourIntegration(unittest.TestCase):
             num_recent_pages=2,
             req_to_token=req_to_token,
             key_buffer=key_buffer,
-            extra_config=_all_four_config(),
+            extra_config={
+                **_all_four_config(),
+                "quest_max_selected_tokens": max_selected_tokens,
+            },
         )
         req_pool_indices = torch.arange(3, dtype=torch.int64, device=device)
         sparse_mask = torch.tensor([True, False, True], device=device)
@@ -422,7 +447,7 @@ class TestQuestAllFourIntegration(unittest.TestCase):
                 req_pool_indices,
                 sparse_mask,
                 device,
-                fixed_capacity=64,
+                fixed_capacity=graph_capacity_pages,
             )
             # Build the alternate budget plan outside graph capture, just as
             # production graph setup precomputes shape-specific state.
@@ -435,10 +460,25 @@ class TestQuestAllFourIntegration(unittest.TestCase):
         plan = algorithm._retrieval_plan
         self.assertTrue(plan.fixed_capacity)
         full_width = plan.max_k + algorithm.num_recent_pages
+        budget_plan = algorithm._get_retrieval_plan_for_ratio(
+            plan, algorithm.sparsity_ratio * 0.75
+        )
+        budget_width = budget_plan.max_k + algorithm.num_recent_pages
+        self.assertEqual(algorithm.quest_max_selected_pages, max_selected_pages)
+        self.assertEqual(full_width, max_selected_pages)
+        self.assertLess(budget_width, full_width)
+        self.assertLessEqual(budget_width, max_selected_pages)
+        self.assertTrue(
+            torch.all(
+                plan.k_per_req <= max_selected_pages - algorithm.num_recent_pages
+            ).item()
+        )
         metadata = _make_metadata(3, full_width, device)
 
         # Warm both budget widths and prove the eager-only fused kernel cannot
         # be selected by a fixed-capacity CUDA Graph plan.
+        warm_valid_lengths = []
+        warm_widths = {}
         with patch(
             "sglang.jit_kernel.quest.topk." "quest_topk_to_flashattention_metadata_out",
             side_effect=AssertionError("fixed plan entered eager fused top-k"),
@@ -449,14 +489,21 @@ class TestQuestAllFourIntegration(unittest.TestCase):
             wraps=quest_finalize_to_flashattention_metadata_,
         ) as direct_finalize:
             for layer_id in range(_END_LAYER):
-                algorithm.retrieve_topk(
-                    queries[layer_id],
-                    layer_id,
-                    req_pool_indices,
-                    sparse_mask,
-                    forward_batch=forward_batch,
-                    attn_metadata=metadata,
+                selected_pages, valid_lengths, metadata_prepared = (
+                    algorithm.retrieve_topk(
+                        queries[layer_id],
+                        layer_id,
+                        req_pool_indices,
+                        sparse_mask,
+                        forward_batch=forward_batch,
+                        attn_metadata=metadata,
+                    )
                 )
+                self.assertTrue(metadata_prepared)
+                self.assertLessEqual(selected_pages.shape[1], max_selected_pages)
+                warm_valid_lengths.append(valid_lengths.clone())
+                if layer_id in (3, 4, 23, 24):
+                    warm_widths[layer_id] = selected_pages.shape[1]
                 algorithm.update_representations(
                     layer_id,
                     req_pool_indices,
@@ -465,6 +512,13 @@ class TestQuestAllFourIntegration(unittest.TestCase):
                     forward_batch,
                 )
         torch.cuda.synchronize()
+        self.assertTrue(
+            torch.all(torch.stack(warm_valid_lengths) <= max_selected_pages).item()
+        )
+        self.assertEqual(warm_widths[3], full_width)
+        self.assertEqual(warm_widths[4], budget_width)
+        self.assertEqual(warm_widths[23], budget_width)
+        self.assertEqual(warm_widths[24], full_width)
         self.assertEqual(direct_finalize.call_count, _END_LAYER // 2)
         self.assertEqual(
             [call.kwargs["update_lengths"] for call in direct_finalize.call_args_list],
@@ -497,6 +551,7 @@ class TestQuestAllFourIntegration(unittest.TestCase):
         begin_fixed_forward()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
+        captured_widths = {}
         with torch.cuda.graph(graph):
             for layer_id in range(_END_LAYER):
                 selected_pages, valid_lengths, metadata_prepared = (
@@ -509,6 +564,8 @@ class TestQuestAllFourIntegration(unittest.TestCase):
                         attn_metadata=metadata,
                     )
                 )
+                if layer_id in (3, 4, 23, 24):
+                    captured_widths[layer_id] = selected_pages.shape[1]
                 algorithm.update_representations(
                     layer_id,
                     req_pool_indices,
@@ -518,6 +575,7 @@ class TestQuestAllFourIntegration(unittest.TestCase):
                 )
 
         torch.cuda.synchronize()
+        self.assertEqual(captured_widths, warm_widths)
         self.assertFalse(algorithm.states.repr_constructed.any().item())
         self.assertFalse(algorithm.states.last_constructed_page.any().item())
         algorithm.finalize_forward(forward_batch)
@@ -554,6 +612,8 @@ class TestQuestAllFourIntegration(unittest.TestCase):
         algorithm.finalize_forward(forward_batch)
         torch.cuda.synchronize()
         self.assertTrue(metadata_prepared)
+        self.assertLessEqual(selected_pages.shape[1], max_selected_pages)
+        self.assertTrue(torch.all(valid_lengths <= max_selected_pages).item())
         self.assertEqual(
             (
                 selected_pages.data_ptr(),

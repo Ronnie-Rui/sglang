@@ -2129,7 +2129,8 @@ class ServerArgs:
                 '"host_to_device_ratio": 2}\'. For Quest runtime attention, '
                 "use e.g. "
                 '\'{"algorithm":"quest","backend":"fa3","page_size":16,'
-                '"sparsity_ratio":0.5}\'. The Quest page_size also configures '
+                '"sparsity_ratio":0.5,"quest_max_selected_tokens":2048}\'. '
+                "The Quest page_size also configures "
                 "the runtime KV page size; an explicit --page-size must match it."
             ),
             aliases=["--hierarchical-sparse-attention-extra-config"],
