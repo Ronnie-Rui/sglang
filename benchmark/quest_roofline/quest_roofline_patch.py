@@ -66,6 +66,10 @@ def build_fixed_page_plan(
     """
     import torch
 
+    from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
+        _float32_scaled_count,
+    )
+
     batch_size = queries.shape[0]
     device = queries.device
     seq_lens = _host_seq_lens(algorithm, forward_batch, batch_size)
@@ -78,12 +82,17 @@ def build_fixed_page_plan(
         max(page_count - algorithm.num_recent_pages, 0) for page_count in page_counts
     ]
     history_kept_host = [
-        min(
-            max(int(history_count * algorithm.sparsity_ratio), 1),
-            history_count,
+        (
+            min(
+                max(
+                    _float32_scaled_count(history_count, algorithm.sparsity_ratio),
+                    1,
+                ),
+                history_count,
+            )
+            if page_count > algorithm.num_recent_pages
+            else 0
         )
-        if page_count > algorithm.num_recent_pages
-        else 0
         for page_count, history_count in zip(page_counts, history_counts)
     ]
     if batch_size == 1:
@@ -101,9 +110,11 @@ def build_fixed_page_plan(
             for kept, page_count in zip(history_kept_device.tolist(), page_counts)
         ]
     selected_counts = [
-        kept + algorithm.num_recent_pages
-        if page_count > algorithm.num_recent_pages
-        else 0
+        (
+            kept + algorithm.num_recent_pages
+            if page_count > algorithm.num_recent_pages
+            else 0
+        )
         for page_count, kept in zip(page_counts, history_kept)
     ]
     width = max(max(selected_counts, default=0), 1)
@@ -163,10 +174,12 @@ def _fixed_begin_forward(
     req_pool_indices,
     sparse_mask,
     device,
+    fixed_capacity: bool | int = False,
 ):
-    del forward_batch, req_pool_indices, sparse_mask, device
+    del forward_batch, req_pool_indices, sparse_mask, device, fixed_capacity
     # Newer Quest baselines build a reusable logical/physical page plan before
-    # layer 0. The fixed roofline must bypass that retrieval preprocessing too.
+    # layer 0. The fixed roofline must bypass that retrieval preprocessing too,
+    # including when production passes its CUDA graph page-bucket capacity.
     self._retrieval_plan = None
 
 

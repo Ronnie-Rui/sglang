@@ -67,6 +67,21 @@ class TestFixedPagePlan(unittest.TestCase):
         self.assertEqual(selected[0, :124].tolist(), list(range(124)))
         self.assertEqual(selected[0, 124:126].tolist(), [508, 509])
 
+    def test_single_request_uses_production_float32_page_count(self):
+        algorithm = _Algorithm()
+        algorithm.page_size = 1
+        algorithm.num_recent_pages = 0
+        algorithm.sparsity_ratio = 0.244094488
+        selected, lengths = build_fixed_page_plan(
+            algorithm,
+            queries=torch.empty((1, 2, 4)),
+            sparse_mask=torch.tensor([True]),
+            forward_batch=SimpleNamespace(seq_lens_cpu=[1143]),
+        )
+
+        self.assertEqual(lengths.tolist(), [279])
+        self.assertEqual(selected[0, :279].tolist(), list(range(279)))
+
 
 class TestPatches(unittest.TestCase):
     def test_fixed_quest_disables_forward_plan_and_representation_pool(self):
@@ -82,7 +97,10 @@ class TestPatches(unittest.TestCase):
         quest = Quest()
 
         quest._initialize_representation_pools(0, 2, 10)
-        quest.begin_forward(None, None, None, None)
+        # SparseCoordinator forwards the selected CUDA graph page bucket as a
+        # keyword argument in production. The roofline replacement must accept
+        # that call while continuing to bypass the real retrieval plan.
+        quest.begin_forward(None, None, None, None, fixed_capacity=640)
 
         self.assertEqual(quest.page_k_min, {})
         self.assertEqual(quest.page_k_max, {})
