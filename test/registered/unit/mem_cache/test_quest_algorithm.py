@@ -85,13 +85,14 @@ def _make_algorithm(
     seed,
     sparse_extra_config=None,
     end_layer=1,
+    k_dtype=torch.float32,
 ):
     torch.manual_seed(seed)
     req_to_token, total_tokens = _build_req_to_token(
         batch_size, seq_lens, page_size, device
     )
     k_buffer = torch.randn(
-        total_tokens, kv_heads, head_dim, dtype=torch.float32, device=device
+        total_tokens, kv_heads, head_dim, dtype=k_dtype, device=device
     )
     config = _Config(page_size, sparsity_ratio, num_recent_pages, sparse_extra_config)
     algo = QuestAlgorithm(config, device)
@@ -1762,6 +1763,110 @@ def _reference_compute_page_reps_masked(
     algo.page_k_min[layer_id][target_pages] = page_min[idx[:, 0], idx[:, 1]]
     algo.page_k_max[layer_id][target_pages] = page_max[idx[:, 0], idx[:, 1]]
     algo.page_valid[layer_id][target_pages] = True
+
+
+class TestQuestNativePageBoundsDtype(CustomTestCase):
+    device = torch.device("cpu")
+
+    def _make(self, k_dtype, *, native=None, seed=31):
+        sparse_extra_config = (
+            {} if native is None else {"use_native_page_bounds_dtype": native}
+        )
+        seq_lens = torch.tensor([9], dtype=torch.int64, device=self.device)
+        return _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=4,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=2,
+            head_dim=8,
+            device=self.device,
+            seed=seed,
+            sparse_extra_config=sparse_extra_config,
+            k_dtype=k_dtype,
+        )
+
+    def test_default_and_explicit_false_keep_fp32_bounds(self):
+        for k_dtype in (torch.float16, torch.bfloat16):
+            for native in (None, False):
+                with self.subTest(k_dtype=k_dtype, native=native):
+                    algorithm, _ = self._make(k_dtype, native=native)
+                    self.assertEqual(algorithm.page_k_min[0].dtype, torch.float32)
+                    self.assertEqual(algorithm.page_k_max[0].dtype, torch.float32)
+
+    def test_native_bounds_follow_supported_k_dtype_and_fallback_otherwise(self):
+        cases = (
+            (torch.float16, torch.float16),
+            (torch.bfloat16, torch.bfloat16),
+            (torch.float32, torch.float32),
+            (torch.float64, torch.float32),
+        )
+        for k_dtype, expected_dtype in cases:
+            with self.subTest(k_dtype=k_dtype):
+                algorithm, _ = self._make(k_dtype, native=True)
+                self.assertEqual(algorithm.page_k_min[0].dtype, expected_dtype)
+                self.assertEqual(algorithm.page_k_max[0].dtype, expected_dtype)
+
+    def test_native_representations_and_scores_match_fp32_bounds(self):
+        reqs = torch.zeros(1, dtype=torch.int64, device=self.device)
+        seq_lens = torch.tensor([9], dtype=torch.int64, device=self.device)
+
+        for k_dtype in (torch.float16, torch.bfloat16):
+            for partial_page in (False, True):
+                with self.subTest(k_dtype=k_dtype, partial_page=partial_page):
+                    legacy, legacy_k = self._make(k_dtype, native=False)
+                    native, native_k = self._make(k_dtype, native=True)
+                    self.assertTrue(torch.equal(legacy_k, native_k))
+                    end_pages = (
+                        (seq_lens + legacy.page_size - 1) // legacy.page_size
+                        if partial_page
+                        else seq_lens // legacy.page_size
+                    )
+
+                    legacy._compute_page_representations(
+                        0, reqs, seq_lens, 0, end_pages, legacy_k
+                    )
+                    native._compute_page_representations(
+                        0, reqs, seq_lens, 0, end_pages, native_k
+                    )
+
+                    valid = legacy.page_valid[0]
+                    self.assertTrue(torch.equal(valid, native.page_valid[0]))
+                    for legacy_bounds, native_bounds in (
+                        (legacy.page_k_min[0], native.page_k_min[0]),
+                        (legacy.page_k_max[0], native.page_k_max[0]),
+                    ):
+                        expected = legacy_bounds[valid].to(k_dtype)
+                        actual = native_bounds[valid]
+                        self.assertTrue(
+                            torch.equal(
+                                actual.view(torch.int16), expected.view(torch.int16)
+                            )
+                        )
+
+                    torch.manual_seed(73)
+                    queries = torch.randn(1, 4, 8, dtype=k_dtype, device=self.device)
+                    physical_pages = torch.arange(
+                        legacy.page_k_min[0].shape[0],
+                        dtype=torch.int64,
+                        device=self.device,
+                    ).unsqueeze(0)
+                    legacy_scores = legacy._retrieve_page_scores(
+                        0, physical_pages, reqs, queries
+                    )
+                    native_scores = native._retrieve_page_scores(
+                        0, physical_pages, reqs, queries
+                    )
+
+                    self.assertEqual(native_scores.dtype, torch.float32)
+                    self.assertTrue(torch.equal(native_scores, legacy_scores))
+                    self.assertTrue(
+                        torch.equal(
+                            torch.topk(native_scores, k=2, dim=1).indices,
+                            torch.topk(legacy_scores, k=2, dim=1).indices,
+                        )
+                    )
 
 
 class TestQuestPageRepresentationEquivalence(CustomTestCase):

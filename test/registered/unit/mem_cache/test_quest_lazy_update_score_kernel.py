@@ -23,7 +23,7 @@ class TestQuestLazyUpdateScoreKernel(unittest.TestCase):
     page_size = 4
 
     @staticmethod
-    def _make_inputs():
+    def _make_inputs(*, bounds_dtype=torch.float32, k_dtype=torch.float16):
         device = torch.device("cuda")
         batch_size, max_pages = 3, 4
         kv_heads, query_heads, head_dim = 2, 4, 16
@@ -60,14 +60,14 @@ class TestQuestLazyUpdateScoreKernel(unittest.TestCase):
                 num_pool_pages,
                 kv_heads,
                 head_dim,
-                dtype=torch.float32,
+                dtype=bounds_dtype,
                 device=device,
             ),
             "page_k_max": torch.randn(
                 num_pool_pages,
                 kv_heads,
                 head_dim,
-                dtype=torch.float32,
+                dtype=bounds_dtype,
                 device=device,
             ),
             "page_valid": torch.ones(num_pool_pages, dtype=torch.bool, device=device),
@@ -79,7 +79,7 @@ class TestQuestLazyUpdateScoreKernel(unittest.TestCase):
                 num_k_tokens,
                 kv_heads,
                 head_dim,
-                dtype=torch.float16,
+                dtype=k_dtype,
                 device=device,
             ),
             "repr_constructed": torch.tensor(
@@ -175,8 +175,45 @@ class TestQuestLazyUpdateScoreKernel(unittest.TestCase):
         updated_physical_page = int(actual_inputs["physical_pages"][1, 1].item())
         self.assertTrue(actual_inputs["page_valid"][updated_physical_page].item())
 
-    def test_cuda_graph_replay_uses_new_ready_boundary(self):
-        source = self._make_inputs()
+    def _assert_native_bounds_match_update_then_score(self, dtype):
+        source = self._make_inputs(bounds_dtype=dtype, k_dtype=dtype)
+        expected_inputs = self._clone_inputs(source)
+        actual_inputs = self._clone_inputs(source)
+
+        expected_scores = self._run_reference(expected_inputs)
+        actual_scores = self._run_lazy(actual_inputs)
+        torch.cuda.synchronize()
+        self._assert_results(
+            actual_scores, actual_inputs, expected_scores, expected_inputs
+        )
+        self.assertEqual(actual_inputs["page_k_min"].dtype, dtype)
+        self.assertEqual(actual_inputs["page_k_max"].dtype, dtype)
+
+    def test_native_fp16_matches_update_then_score(self):
+        self._assert_native_bounds_match_update_then_score(torch.float16)
+
+    def test_native_bfloat16_matches_update_then_score(self):
+        if not torch.cuda.is_bf16_supported():
+            self.skipTest("CUDA device does not support bfloat16")
+        self._assert_native_bounds_match_update_then_score(torch.bfloat16)
+
+    def test_rejects_native_bounds_k_cache_dtype_mismatch(self):
+        inputs = self._make_inputs(bounds_dtype=torch.bfloat16, k_dtype=torch.float16)
+
+        with self.assertRaisesRegex(ValueError, "must match the K-cache dtype"):
+            self._run_lazy(inputs)
+
+    def test_rejects_min_max_dtype_mismatch(self):
+        inputs = self._make_inputs(bounds_dtype=torch.bfloat16, k_dtype=torch.bfloat16)
+        inputs["page_k_max"] = inputs["page_k_max"].to(torch.float16)
+
+        with self.assertRaisesRegex(ValueError, "must share fp16, bf16, or fp32"):
+            self._run_lazy(inputs)
+
+    def test_native_bfloat16_cuda_graph_replay_uses_new_ready_boundary(self):
+        if not torch.cuda.is_bf16_supported():
+            self.skipTest("CUDA device does not support bfloat16")
+        source = self._make_inputs(bounds_dtype=torch.bfloat16, k_dtype=torch.bfloat16)
         actual_inputs = self._clone_inputs(source)
 
         # Compile before capture, then restore the mutable pools and trackers.

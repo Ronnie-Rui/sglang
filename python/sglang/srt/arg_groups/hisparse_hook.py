@@ -20,6 +20,7 @@ RUNTIME_SPARSE_BACKENDS_BY_ALGORITHM = {
 }
 RUNTIME_SPARSE_ALGORITHMS = set(RUNTIME_SPARSE_BACKENDS_BY_ALGORITHM)
 RUNTIME_SPARSE_ATTENTION_BACKEND_ALIASES = {"flashattention": "fa3"}
+QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION = "use_native_page_bounds_dtype"
 
 
 def _load_hisparse_config(server_args: ServerArgs) -> dict:
@@ -34,6 +35,26 @@ def _load_hisparse_config(server_args: ServerArgs) -> dict:
             f"hisparse_config must be a JSON object, got {type(config).__name__}."
         )
     return config
+
+
+def use_native_quest_page_bounds_dtype(server_args: ServerArgs) -> bool:
+    return (
+        _load_hisparse_config(server_args).get(
+            QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION, False
+        )
+        is True
+    )
+
+
+def resolve_quest_page_bounds_dtype(kv_cache_dtype, use_native_page_bounds_dtype: bool):
+    import torch
+
+    if use_native_page_bounds_dtype and kv_cache_dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        return kv_cache_dtype
+    return torch.float32
 
 
 def get_hisparse_algorithm(server_args: ServerArgs) -> str | None:

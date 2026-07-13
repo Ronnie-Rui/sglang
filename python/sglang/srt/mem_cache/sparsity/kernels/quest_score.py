@@ -2,6 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache.sparsity.kernels.quest_dtype import (
+    validate_quest_page_bounds_dtype,
+    validate_quest_page_bounds_k_dtype,
+)
+
 
 @triton.jit
 def _quest_page_score_kernel(
@@ -350,8 +355,7 @@ def quest_page_scores(
         raise ValueError(
             "Quest page min/max tensors must have matching [pages, heads, dim] shapes"
         )
-    if page_k_min.dtype != torch.float32 or page_k_max.dtype != torch.float32:
-        raise ValueError("Quest page min/max tensors must use float32")
+    validate_quest_page_bounds_dtype(page_k_min, page_k_max)
     if not page_k_min.is_contiguous() or not page_k_max.is_contiguous():
         raise ValueError("Quest page min/max tensors must be contiguous")
     if (
@@ -515,8 +519,7 @@ def quest_lazy_update_page_scores(
         raise ValueError("Quest lazy score queries must use fp16, bf16, or fp32")
     if page_k_min.ndim != 3 or page_k_max.shape != page_k_min.shape:
         raise ValueError("Quest page min/max tensors must have matching 3D shapes")
-    if page_k_min.dtype != torch.float32 or page_k_max.dtype != torch.float32:
-        raise ValueError("Quest page min/max tensors must use float32")
+    validate_quest_page_bounds_dtype(page_k_min, page_k_max)
     if not page_k_min.is_contiguous() or not page_k_max.is_contiguous():
         raise ValueError("Quest page min/max tensors must be contiguous")
 
@@ -572,6 +575,7 @@ def quest_lazy_update_page_scores(
         torch.float32,
     ):
         raise ValueError("Quest K cache must be a 3D floating-point tensor")
+    validate_quest_page_bounds_k_dtype(page_k_min, k_buffer)
     if k_buffer.shape[0] <= 0 or k_buffer.shape[1:] != (kv_heads, head_dim):
         raise ValueError("Quest K cache and representation dimensions must match")
     if repr_constructed.ndim != 1 or repr_constructed.dtype != torch.bool:

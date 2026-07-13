@@ -53,7 +53,7 @@ class _ForwardBatch:
         self.forward_mode = SimpleNamespace(is_decode=lambda: True)
 
 
-def _build_storage(seq_lens, page_size, device, seed):
+def _build_storage(seq_lens, page_size, device, seed, dtype=torch.float32):
     batch_size = seq_lens.numel()
     max_seq_len = int(seq_lens.max().item())
     tokens_per_req = ((max_seq_len + page_size - 1) // page_size) * page_size
@@ -66,7 +66,7 @@ def _build_storage(seq_lens, page_size, device, seed):
         batch_size * tokens_per_req,
         1,
         8,
-        dtype=torch.float32,
+        dtype=dtype,
         device=device,
         generator=generator,
     )
@@ -141,13 +141,16 @@ def _expected_fa_lengths(valid_lengths, sparse_mask, seq_lens, page_size):
     return cache_seqlens, cu_seqlens
 
 
-def _all_four_config():
-    return {
+def _all_four_config(*, use_native_page_bounds_dtype=False):
+    config = {
         "layer_selection_reuse_interval": 2,
         "layer_page_budget": _BUDGET,
         "use_fused_topk_fa_metadata_kernel": True,
         "use_lazy_page_update_score_kernel": True,
     }
+    if use_native_page_bounds_dtype:
+        config["use_native_page_bounds_dtype"] = True
+    return config
 
 
 class TestExpectedFALengths(unittest.TestCase):
@@ -192,7 +195,9 @@ class TestQuestAllFourIntegration(unittest.TestCase):
         # [4, 24) budget width of 191. This exercises realistic non-trivial
         # fused-kernel widths while retaining ragged rows and an inactive row.
         seq_lens = torch.tensor([2564, 2308, 2052], device=device)
-        req_to_token, key_buffer = _build_storage(seq_lens, page_size, device, seed=317)
+        req_to_token, key_buffer = _build_storage(
+            seq_lens, page_size, device, seed=317, dtype=torch.float16
+        )
         common = dict(
             seq_lens=seq_lens,
             page_size=page_size,
@@ -201,7 +206,10 @@ class TestQuestAllFourIntegration(unittest.TestCase):
             req_to_token=req_to_token,
             key_buffer=key_buffer,
         )
-        actual = _make_algorithm(**common, extra_config=_all_four_config())
+        actual = _make_algorithm(
+            **common,
+            extra_config=_all_four_config(use_native_page_bounds_dtype=True),
+        )
         reference = _make_algorithm(
             **common,
             extra_config={
@@ -209,6 +217,9 @@ class TestQuestAllFourIntegration(unittest.TestCase):
                 "layer_page_budget": _BUDGET,
             },
         )
+        self.assertEqual(actual.page_k_min[0].dtype, torch.float16)
+        self.assertEqual(actual.page_k_max[0].dtype, torch.float16)
+        self.assertEqual(reference.page_k_min[0].dtype, torch.float32)
 
         req_pool_indices = torch.arange(3, dtype=torch.int64, device=device)
         sparse_mask = torch.tensor([True, False, True], device=device)

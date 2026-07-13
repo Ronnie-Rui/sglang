@@ -17,14 +17,14 @@ def _reference_scores(
     active_mask: torch.Tensor | None = None,
     history_page_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    k_min = page_k_min[physical_pages]
-    k_max = page_k_max[physical_pages]
+    k_min = page_k_min[physical_pages].to(torch.float32)
+    k_max = page_k_max[physical_pages].to(torch.float32)
     valid = page_valid[physical_pages]
     batch_size, query_heads, head_dim = queries.shape
     kv_heads = k_min.shape[-2]
     group_size = query_heads // kv_heads
     query = queries.reshape(batch_size, kv_heads, group_size, head_dim)
-    query = query.to(k_min.dtype).unsqueeze(1)
+    query = query.to(torch.float32).unsqueeze(1)
     bounds = torch.where(
         query >= 0,
         query * k_max.unsqueeze(3),
@@ -125,6 +125,59 @@ class TestQuestScoreKernel(unittest.TestCase):
                         expected.topk(topk, dim=1).indices,
                     )
                 )
+
+    def test_native_bounds_are_scored_against_float32_reference(self):
+        torch.manual_seed(9)
+        device = torch.device("cuda")
+        physical_pages = torch.tensor(
+            [[0, 2, 4, 6], [1, 3, 5, 7]],
+            dtype=torch.int64,
+            device=device,
+        )
+        page_valid = torch.tensor(
+            [True, True, False, True, True, True, True, False],
+            dtype=torch.bool,
+            device=device,
+        )
+
+        for bounds_dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(bounds_dtype=bounds_dtype):
+                page_k_min = torch.randn((8, 2, 64), dtype=bounds_dtype, device=device)
+                page_k_max = (
+                    page_k_min.to(torch.float32)
+                    + torch.rand((8, 2, 64), dtype=torch.float32, device=device)
+                ).to(bounds_dtype)
+                queries = torch.randn((2, 4, 64), dtype=bounds_dtype, device=device)
+
+                expected = _reference_scores(
+                    queries,
+                    page_k_min,
+                    page_k_max,
+                    page_valid,
+                    physical_pages,
+                )
+                actual = quest_page_scores(
+                    queries,
+                    page_k_min,
+                    page_k_max,
+                    page_valid,
+                    physical_pages,
+                )
+
+                self.assertEqual(expected.dtype, torch.float32)
+                self.assertEqual(actual.dtype, torch.float32)
+                torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-3)
+
+    def test_rejects_mismatched_page_bounds_dtype(self):
+        device = torch.device("cuda")
+        with self.assertRaisesRegex(ValueError, "must share.*dtype"):
+            quest_page_scores(
+                torch.empty((1, 2, 8), dtype=torch.float16, device=device),
+                torch.empty((4, 1, 8), dtype=torch.float16, device=device),
+                torch.empty((4, 1, 8), dtype=torch.bfloat16, device=device),
+                torch.ones(4, dtype=torch.bool, device=device),
+                torch.zeros((1, 1), dtype=torch.int64, device=device),
+            )
 
     def test_empty_batch_and_page_dimensions(self):
         device = torch.device("cuda")

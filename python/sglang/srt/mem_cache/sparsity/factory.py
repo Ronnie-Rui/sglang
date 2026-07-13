@@ -4,6 +4,9 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.arg_groups.hisparse_hook import (
+    QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION,
+)
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_dsa import DeepSeekDSAAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
@@ -270,6 +273,7 @@ def parse_runtime_sparse_config(server_args) -> SparseConfig:
         "use_direct_fa_metadata_kernel",
         "use_fused_topk_fa_metadata_kernel",
         "use_lazy_page_update_score_kernel",
+        QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION,
     )
     for option in boolean_options:
         if option not in config.sparse_extra_config:

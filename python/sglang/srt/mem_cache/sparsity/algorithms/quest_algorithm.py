@@ -11,6 +11,10 @@ import logging
 
 import torch
 
+from sglang.srt.arg_groups.hisparse_hook import (
+    QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION,
+    resolve_quest_page_bounds_dtype,
+)
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
     BaseSparseAlgorithmImpl,
 )
@@ -46,6 +50,9 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         )
         self.use_lazy_page_update_score_kernel = config.sparse_extra_config.get(
             "use_lazy_page_update_score_kernel", False
+        )
+        self.use_native_page_bounds_dtype = config.sparse_extra_config.get(
+            QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION, False
         )
         self.layer_selection_reuse_interval = config.sparse_extra_config.get(
             "layer_selection_reuse_interval", 1
@@ -409,11 +416,14 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
     ):
         key_buf = self.token_to_kv_pool.get_key_buffer(start_layer)
         head_num, head_dim = key_buf.shape[1], key_buf.shape[2]
+        bounds_dtype = resolve_quest_page_bounds_dtype(
+            key_buf.dtype, self.use_native_page_bounds_dtype
+        )
 
         for layer_id in range(start_layer, end_layer):
             self.page_k_min[layer_id] = torch.zeros(
                 (total_num_pages, head_num, head_dim),
-                dtype=torch.float32,
+                dtype=bounds_dtype,
                 device=self.device,
             )
             self.page_k_max[layer_id] = torch.zeros_like(self.page_k_min[layer_id])
@@ -422,11 +432,13 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             )
 
         logger.info(
-            "Initialized Quest page reps: %d pages, %d layers, head_num=%d, head_dim=%d",
+            "Initialized Quest page reps: %d pages, %d layers, head_num=%d, "
+            "head_dim=%d, bounds_dtype=%s",
             total_num_pages,
             end_layer - start_layer,
             head_num,
             head_dim,
+            bounds_dtype,
         )
 
     def _compute_page_representations(
@@ -461,7 +473,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             tok_pos.clamp(0, req_to_token.shape[1] - 1),
         ].clamp(0, k_buffer.shape[0] - 1)
 
-        keys = k_buffer[phys_tok].to(torch.float32)
+        keys = k_buffer[phys_tok].to(self.page_k_min[layer_id].dtype)
 
         if bool((end_page * self.page_size <= seq_lens).all().item()):
             page_min = keys.amin(dim=2)
@@ -605,8 +617,8 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         # Clamp pages only for the portable torch fallback. The Triton kernel
         # handles invalid physical page ids without this allocation.
         phys_pages_clamped = phys_pages.clamp(0, self.page_k_min[layer_id].shape[0] - 1)
-        k_min = self.page_k_min[layer_id][phys_pages_clamped]
-        k_max = self.page_k_max[layer_id][phys_pages_clamped]
+        k_min = self.page_k_min[layer_id][phys_pages_clamped].to(torch.float32)
+        k_max = self.page_k_max[layer_id][phys_pages_clamped].to(torch.float32)
         valid_mask = self.page_valid[layer_id][phys_pages_clamped] & (
             (physical_pages >= 0)
             & (physical_pages < self.page_k_min[layer_id].shape[0])
@@ -638,7 +650,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         # then use the largest bound as the conservative shared-page score.
         group = q_heads // kv_heads
         q = q.view(q.shape[0], kv_heads, group, head_dim)
-        q = q.to(k_min.dtype).unsqueeze(1)
+        q = q.to(torch.float32).unsqueeze(1)
         k_min = k_min.unsqueeze(3)
         k_max = k_max.unsqueeze(3)
         per_head_bound = torch.where(q >= 0, q * k_max, q * k_min).sum(dim=-1)

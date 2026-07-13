@@ -10,6 +10,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -63,6 +65,8 @@ def _make_model_runner(
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
     enable_runtime_sparse_attention=False,
+    kv_cache_dtype="fake_bf16",
+    use_native_page_bounds_dtype=False,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -98,7 +102,7 @@ def _make_model_runner(
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mr.model_config = mc
 
-    mr.kv_cache_dtype = "fake_bf16"
+    mr.kv_cache_dtype = kv_cache_dtype
 
     sa = SimpleNamespace()
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
@@ -117,9 +121,13 @@ def _make_model_runner(
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_dsa_cache_layer_split = False
-    sa.hisparse_config = (
-        '{"algorithm":"quest"}' if enable_runtime_sparse_attention else None
-    )
+    if enable_runtime_sparse_attention:
+        native_bounds = str(use_native_page_bounds_dtype).lower()
+        sa.hisparse_config = (
+            '{"algorithm":"quest","use_native_page_bounds_dtype":' f"{native_bounds}}}"
+        )
+    else:
+        sa.hisparse_config = None
     mr.server_args = sa
 
     spec = MagicMock()
@@ -233,6 +241,66 @@ class TestDefaultConfigurator(unittest.TestCase):
         )
         self.assertEqual(config.max_total_num_tokens, expected_pages * page_size)
         self.assertLessEqual(used, available)
+
+    def test_runtime_quest_native_bounds_release_budgeted_capacity(self):
+        available = 10_000_000
+        page_size = 16
+        legacy_mr, _, legacy = self._run(
+            available,
+            page_size=page_size,
+            enable_runtime_sparse_attention=True,
+            kv_cache_dtype=torch.bfloat16,
+        )
+        native_mr, _, native = self._run(
+            available,
+            page_size=page_size,
+            enable_runtime_sparse_attention=True,
+            kv_cache_dtype=torch.bfloat16,
+            use_native_page_bounds_dtype=True,
+        )
+
+        kv_bytes_per_token = _actual_memory_used(
+            native_mr,
+            SimpleNamespace(max_total_num_tokens=1),
+        )
+        representation_bytes_per_page = native_mr.num_effective_layers * (
+            2
+            * native_mr.model_config.get_num_kv_heads(1)
+            * native_mr.model_config.head_dim
+            * torch.bfloat16.itemsize
+            + torch.bool.itemsize
+        )
+        num_representation_pages = native.max_total_num_tokens // page_size + 1
+        used = (
+            native.max_total_num_tokens * kv_bytes_per_token
+            + num_representation_pages * representation_bytes_per_page
+        )
+
+        self.assertGreater(native.max_total_num_tokens, legacy.max_total_num_tokens)
+        self.assertEqual(legacy_mr.num_effective_layers, native_mr.num_effective_layers)
+        self.assertLessEqual(used, available)
+
+    def test_runtime_quest_native_bounds_fallback_dtypes_keep_fp32_budget(self):
+        available = 10_000_000
+        page_size = 16
+        for kv_cache_dtype in (torch.float32, torch.float8_e4m3fn):
+            with self.subTest(kv_cache_dtype=kv_cache_dtype):
+                _, _, legacy = self._run(
+                    available,
+                    page_size=page_size,
+                    enable_runtime_sparse_attention=True,
+                    kv_cache_dtype=kv_cache_dtype,
+                )
+                _, _, native = self._run(
+                    available,
+                    page_size=page_size,
+                    enable_runtime_sparse_attention=True,
+                    kv_cache_dtype=kv_cache_dtype,
+                    use_native_page_bounds_dtype=True,
+                )
+                self.assertEqual(
+                    native.max_total_num_tokens, legacy.max_total_num_tokens
+                )
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):

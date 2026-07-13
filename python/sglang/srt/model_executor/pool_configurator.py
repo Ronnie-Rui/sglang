@@ -19,7 +19,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.hisparse_hook import get_hisparse_algorithm
+from sglang.srt.arg_groups.hisparse_hook import (
+    get_hisparse_algorithm,
+    resolve_quest_page_bounds_dtype,
+    use_native_quest_page_bounds_dtype,
+)
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
@@ -143,11 +147,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             and get_hisparse_algorithm(mr.server_args) == "quest"
         ):
             kv_heads = mr.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
-            # Quest stores FP32 key minima/maxima and one validity bit (materialized
-            # as torch.bool) for every local layer and physical KV page.
+            bounds_dtype = resolve_quest_page_bounds_dtype(
+                mr.kv_cache_dtype,
+                use_native_quest_page_bounds_dtype(mr.server_args),
+            )
+            bounds_element_size = bounds_dtype.itemsize
+            # Quest stores key minima/maxima and one validity bit (materialized as
+            # torch.bool) for every local layer and physical KV page.
             local_layers = mr.end_layer - mr.start_layer
             self._runtime_sparse_representation_bytes_per_page = local_layers * (
-                2 * kv_heads * mr.model_config.head_dim * torch.float32.itemsize
+                2 * kv_heads * mr.model_config.head_dim * bounds_element_size
                 + torch.bool.itemsize
             )
 

@@ -2,6 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache.sparsity.kernels.quest_dtype import (
+    validate_quest_page_bounds_dtype,
+    validate_quest_page_bounds_k_dtype,
+)
+
 
 @triton.jit
 def _quest_update_page_representations_kernel(
@@ -214,14 +219,14 @@ def quest_update_page_representations_(
         raise ValueError("Quest key buffer must be a 3D floating-point tensor")
     if page_k_min.ndim != 3 or page_k_max.shape != page_k_min.shape:
         raise ValueError("Quest page min/max pools must have matching 3D shapes")
-    if page_k_min.dtype != torch.float32 or page_k_max.dtype != torch.float32:
-        raise ValueError("Quest page min/max pools must use float32")
+    validate_quest_page_bounds_dtype(page_k_min, page_k_max)
     if not page_k_min.is_contiguous() or not page_k_max.is_contiguous():
         raise ValueError("Quest page min/max pools must be contiguous")
 
     num_pool_pages, kv_heads, head_dim = page_k_min.shape
     if k_buffer.shape[1:] != (kv_heads, head_dim):
         raise ValueError("Quest key buffer and representation dimensions must match")
+    validate_quest_page_bounds_k_dtype(page_k_min, k_buffer)
     if (
         page_valid.shape != (num_pool_pages,)
         or page_valid.dtype != torch.bool

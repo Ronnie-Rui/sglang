@@ -127,7 +127,11 @@ class TestQuestPageUpdateKernel(unittest.TestCase):
     page_size = 4
 
     @staticmethod
-    def _make_inputs():
+    def _make_inputs(
+        *,
+        bounds_dtype: torch.dtype = torch.float32,
+        k_dtype: torch.dtype = torch.float16,
+    ):
         device = torch.device("cuda")
         req_to_token = torch.tensor(
             [
@@ -140,7 +144,7 @@ class TestQuestPageUpdateKernel(unittest.TestCase):
             device=device,
         )
         torch.manual_seed(17)
-        k_buffer = torch.randn(128, 3, 33, dtype=torch.float16, device=device)
+        k_buffer = torch.randn(128, 3, 33, dtype=k_dtype, device=device)
         return {
             "req_pool_indices": torch.tensor(
                 [3, 0, 2], dtype=torch.int64, device=device
@@ -155,8 +159,8 @@ class TestQuestPageUpdateKernel(unittest.TestCase):
             "last_constructed_page": torch.tensor(
                 [99, 0, 1, 2], dtype=torch.int64, device=device
             ),
-            "page_k_min": torch.zeros(32, 3, 33, dtype=torch.float32, device=device),
-            "page_k_max": torch.zeros(32, 3, 33, dtype=torch.float32, device=device),
+            "page_k_min": torch.zeros(32, 3, 33, dtype=bounds_dtype, device=device),
+            "page_k_max": torch.zeros(32, 3, 33, dtype=bounds_dtype, device=device),
             "page_valid": torch.zeros(32, dtype=torch.bool, device=device),
         }
 
@@ -195,6 +199,60 @@ class TestQuestPageUpdateKernel(unittest.TestCase):
     def test_trackers_advance_only_when_requested(self):
         self._assert_matches_reference(advance_trackers=True)
 
+    def test_native_bounds_store_bit_exact_extrema(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                actual = self._make_inputs(bounds_dtype=dtype, k_dtype=dtype)
+                expected = {key: value.clone() for key, value in actual.items()}
+
+                _reference_update(
+                    **expected,
+                    page_size=self.page_size,
+                    advance_trackers=False,
+                )
+                quest_update_page_representations_(
+                    **actual,
+                    page_size=self.page_size,
+                    advance_trackers=False,
+                )
+                torch.cuda.synchronize()
+
+                self.assertEqual(actual["page_k_min"].dtype, dtype)
+                self.assertEqual(actual["page_k_max"].dtype, dtype)
+                self.assertTrue(
+                    torch.equal(actual["page_k_min"], expected["page_k_min"])
+                )
+                self.assertTrue(
+                    torch.equal(actual["page_k_max"], expected["page_k_max"])
+                )
+                self.assertTrue(
+                    torch.equal(actual["page_valid"], expected["page_valid"])
+                )
+
+    def test_rejects_mismatched_native_bounds_dtypes(self):
+        min_max_mismatch = self._make_inputs(
+            bounds_dtype=torch.float16, k_dtype=torch.float16
+        )
+        min_max_mismatch["page_k_max"] = min_max_mismatch["page_k_max"].to(
+            torch.bfloat16
+        )
+        with self.assertRaisesRegex(ValueError, "must share.*dtype"):
+            quest_update_page_representations_(
+                **min_max_mismatch,
+                page_size=self.page_size,
+                advance_trackers=False,
+            )
+
+        k_cache_mismatch = self._make_inputs(
+            bounds_dtype=torch.bfloat16, k_dtype=torch.float16
+        )
+        with self.assertRaisesRegex(ValueError, "must match the K-cache dtype"):
+            quest_update_page_representations_(
+                **k_cache_mismatch,
+                page_size=self.page_size,
+                advance_trackers=False,
+            )
+
     def test_tracker_only_update_uses_complete_page_boundary(self):
         inputs = self._make_inputs()
 
@@ -223,7 +281,10 @@ class TestQuestPageUpdateKernel(unittest.TestCase):
         )
 
     def test_cuda_graph_replay_reads_new_boundaries(self):
-        inputs = self._make_inputs()
+        inputs = self._make_inputs(
+            bounds_dtype=torch.float16,
+            k_dtype=torch.float16,
+        )
         inputs["req_pool_indices"] = inputs["req_pool_indices"][:1]
         inputs["seq_lens"] = inputs["seq_lens"][:1]
         inputs["seq_lens"].fill_(8)
