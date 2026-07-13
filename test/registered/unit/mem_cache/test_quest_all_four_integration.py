@@ -118,6 +118,29 @@ def _selected_rows(selected_pages, valid_lengths):
     ]
 
 
+def _expected_fa_lengths(valid_lengths, sparse_mask, seq_lens, page_size):
+    last_page_lengths = torch.where(
+        seq_lens > 0,
+        (seq_lens - 1) % page_size + 1,
+        torch.zeros_like(seq_lens),
+    )
+    sparse_seq_lens = (
+        valid_lengths.to(seq_lens.dtype) - 1
+    ) * page_size + last_page_lengths
+    cache_seqlens = torch.where(
+        sparse_mask & (valid_lengths > 0),
+        sparse_seq_lens,
+        seq_lens,
+    ).to(torch.int32)
+    cu_seqlens = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32, device=seq_lens.device),
+            cache_seqlens.cumsum(0, dtype=torch.int32),
+        )
+    )
+    return cache_seqlens, cu_seqlens
+
+
 def _all_four_config():
     return {
         "layer_selection_reuse_interval": 2,
@@ -125,6 +148,29 @@ def _all_four_config():
         "use_fused_topk_fa_metadata_kernel": True,
         "use_lazy_page_update_score_kernel": True,
     }
+
+
+class TestExpectedFALengths(unittest.TestCase):
+    def test_uses_token_lengths_and_dense_fallbacks(self):
+        cache_seqlens, cu_seqlens = _expected_fa_lengths(
+            valid_lengths=torch.tensor([3, 0, 2], dtype=torch.int32),
+            sparse_mask=torch.tensor([True, True, False]),
+            seq_lens=torch.tensor([33, 29, 18], dtype=torch.int64),
+            page_size=4,
+        )
+
+        torch.testing.assert_close(
+            cache_seqlens,
+            torch.tensor([9, 29, 18], dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            cu_seqlens,
+            torch.tensor([0, 9, 38, 56], dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
 
 
 @unittest.skipUnless(
@@ -237,17 +283,17 @@ class TestQuestAllFourIntegration(unittest.TestCase):
                     _selected_rows(reference_pages, reference_lengths),
                 )
                 self.assertEqual(actual_lengths[1].item(), 0)
+                expected_cache_seqlens, expected_cu_seqlens = _expected_fa_lengths(
+                    actual_lengths,
+                    sparse_mask,
+                    seq_lens,
+                    page_size,
+                )
                 torch.testing.assert_close(
                     metadata.cache_seqlens_int32,
-                    actual_lengths.to(torch.int32),
+                    expected_cache_seqlens,
                     rtol=0,
                     atol=0,
-                )
-                expected_cu_seqlens = torch.cat(
-                    (
-                        torch.zeros(1, dtype=torch.int32, device=device),
-                        actual_lengths.cumsum(0, dtype=torch.int32),
-                    )
                 )
                 torch.testing.assert_close(
                     metadata.cu_seqlens_k,
@@ -508,17 +554,17 @@ class TestQuestAllFourIntegration(unittest.TestCase):
             output_ptrs,
         )
         self.assertEqual(valid_lengths[1].item(), 0)
+        expected_cache_seqlens, expected_cu_seqlens = _expected_fa_lengths(
+            valid_lengths,
+            sparse_mask,
+            seq_lens,
+            page_size,
+        )
         torch.testing.assert_close(
             metadata.cache_seqlens_int32,
-            valid_lengths.to(torch.int32),
+            expected_cache_seqlens,
             rtol=0,
             atol=0,
-        )
-        expected_cu_seqlens = torch.cat(
-            (
-                torch.zeros(1, dtype=torch.int32, device=device),
-                valid_lengths.cumsum(0, dtype=torch.int32),
-            )
         )
         torch.testing.assert_close(
             metadata.cu_seqlens_k,
