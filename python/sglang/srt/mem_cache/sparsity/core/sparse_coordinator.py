@@ -353,7 +353,7 @@ class SparseCoordinator:
         sparse_mask = self._forward_sparse_mask
         if sparse_mask is None:
             sparse_mask = self._compute_sparse_mask(req_pool_indices)
-        selected_indices, valid_lengths = self.algorithm.retrieve_topk(
+        retrieval_result = self.algorithm.retrieve_topk(
             queries=query,
             layer_id=layer_id,
             req_pool_indices=req_pool_indices,
@@ -362,6 +362,11 @@ class SparseCoordinator:
             attn_metadata=attn_metadata,
             **kwargs,
         )
+        metadata_prepared = False
+        if len(retrieval_result) == 3:
+            selected_indices, valid_lengths, metadata_prepared = retrieval_result
+        else:
+            selected_indices, valid_lengths = retrieval_result
         selected_physical_indices = (
             self.algorithm.get_selected_physical_pages(selected_indices)
             if self.backend_adaptor.requires_selected_physical_indices
@@ -379,6 +384,7 @@ class SparseCoordinator:
             page_size=self.page_size,
             layer_id=layer.layer_id,
             selected_physical_indices=selected_physical_indices,
+            metadata_prepared=metadata_prepared,
         )
 
     def _compute_sparse_mask(self, req_pool_indices):

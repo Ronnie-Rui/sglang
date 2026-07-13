@@ -154,6 +154,28 @@ class FlashAttentionAdaptor(BackendAdaptor):
             return current_metadata
 
         max_selected = selected_indices.shape[1]
+        metadata_prepared = bool(kwargs.get("metadata_prepared", False))
+        if metadata_prepared:
+            if not self._metadata_prepared:
+                self._max_selected = max_selected
+                self._valid_lengths = valid_lengths
+                current_metadata.max_seq_len_k = max(
+                    self._original_metadata["max_seq_len_k"],
+                    max_selected * page_size,
+                )
+                self._metadata_prepared = True
+            elif max_selected != self._max_selected:
+                raise ValueError(
+                    "Sparse selection width changed within one forward: "
+                    f"expected {self._max_selected}, got {max_selected}."
+                )
+            elif _ENABLE_ASYNC_ASSERT:
+                torch._assert_async(
+                    (valid_lengths == self._valid_lengths).all(),
+                    "Sparse valid lengths changed between layers in one forward.",
+                )
+            return current_metadata
+
         use_triton_metadata_kernel = (
             selected_indices.is_cuda
             and torch.version.hip is None

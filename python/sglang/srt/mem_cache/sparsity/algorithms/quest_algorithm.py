@@ -26,12 +26,92 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.use_triton_score_kernel = config.sparse_extra_config.get(
             "use_triton_score_kernel", True
         )
+        self.use_fused_score_mask_kernel = config.sparse_extra_config.get(
+            "use_fused_score_mask_kernel", True
+        )
         self.enable_cuda_graph_retrieval = config.sparse_extra_config.get(
             "enable_cuda_graph_retrieval", True
+        )
+        self.use_jit_topk_kernel = config.sparse_extra_config.get(
+            "use_jit_topk_kernel", True
+        )
+        self.use_triton_page_update_kernel = config.sparse_extra_config.get(
+            "use_triton_page_update_kernel", True
+        )
+        self.use_direct_fa_metadata_kernel = config.sparse_extra_config.get(
+            "use_direct_fa_metadata_kernel", True
         )
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
+
+    def _can_use_triton_page_update(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_buffer: torch.Tensor,
+    ) -> bool:
+        if (
+            not self.use_triton_page_update_kernel
+            or not k_buffer.is_cuda
+            or torch.version.hip is not None
+            or k_buffer.ndim != 3
+            or k_buffer.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or self.page_size <= 0
+            or self.page_size > 128
+            or k_buffer.shape[-1] <= 0
+            or k_buffer.shape[-1] > 256
+        ):
+            return False
+
+        tensors = (
+            req_pool_indices,
+            seq_lens,
+            self.req_to_token_pool.req_to_token,
+            self.states.repr_constructed,
+            self.states.last_constructed_page,
+        )
+        return all(tensor.device == k_buffer.device for tensor in tensors)
+
+    def update_representations(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_buffer: torch.Tensor,
+        forward_batch,
+    ) -> None:
+        if not forward_batch.forward_mode.is_decode():
+            return
+        if not self.should_update_representations(forward_batch):
+            return
+
+        if not self._can_use_triton_page_update(req_pool_indices, seq_lens, k_buffer):
+            return super().update_representations(
+                layer_id,
+                req_pool_indices,
+                seq_lens,
+                k_buffer,
+                forward_batch,
+            )
+
+        from sglang.srt.mem_cache.sparsity.kernels.quest_page_update import (
+            quest_update_page_representations_,
+        )
+
+        quest_update_page_representations_(
+            req_pool_indices,
+            seq_lens,
+            self.req_to_token_pool.req_to_token,
+            k_buffer,
+            self.states.repr_constructed,
+            self.states.last_constructed_page,
+            self.page_k_min[layer_id],
+            self.page_k_max[layer_id],
+            self.page_valid[layer_id],
+            self.page_size,
+            advance_trackers=layer_id == self.end_layer - 1,
+        )
 
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int
@@ -129,6 +209,34 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.page_k_max[layer_id][target_pages] = page_max[idx[:, 0], idx[:, 1]]
         self.page_valid[layer_id][target_pages] = True
 
+    def _can_use_triton_score_kernel(self, queries: torch.Tensor) -> bool:
+        return (
+            self.use_triton_score_kernel
+            and queries.is_cuda
+            and torch.version.hip is None
+            and self.page_k_min
+            and next(iter(self.page_k_min.values())).shape[-1] <= 256
+        )
+
+    def _retrieve_page_scores_batched(self, layer_id, queries, plan) -> torch.Tensor:
+        if self.use_fused_score_mask_kernel and self._can_use_triton_score_kernel(
+            queries
+        ):
+            from sglang.srt.mem_cache.sparsity.kernels.quest_score import (
+                quest_page_scores,
+            )
+
+            return quest_page_scores(
+                queries,
+                self.page_k_min[layer_id],
+                self.page_k_max[layer_id],
+                self.page_valid[layer_id],
+                plan.physical_pages,
+                active_mask=plan.active_mask,
+                history_page_counts=plan.recent_start,
+            )
+        return super()._retrieve_page_scores_batched(layer_id, queries, plan)
+
     def _retrieve_page_scores(
         self,
         layer_id: int,
@@ -137,15 +245,8 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         queries: torch.Tensor,
     ) -> torch.Tensor:
         physical_pages = phys_pages
-        # Clamp pages to valid storage range for the portable torch fallback.
-        phys_pages_clamped = phys_pages.clamp(0, self.page_k_min[layer_id].shape[0] - 1)
 
-        if (
-            self.use_triton_score_kernel
-            and queries.is_cuda
-            and torch.version.hip is None
-            and self.page_k_min[layer_id].shape[-1] <= 256
-        ):
+        if self._can_use_triton_score_kernel(queries):
             from sglang.srt.mem_cache.sparsity.kernels.quest_score import (
                 quest_page_scores,
             )
@@ -158,6 +259,9 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 physical_pages,
             )
 
+        # Clamp pages only for the portable torch fallback. The Triton kernel
+        # handles invalid physical page ids without this allocation.
+        phys_pages_clamped = phys_pages.clamp(0, self.page_k_min[layer_id].shape[0] - 1)
         k_min = self.page_k_min[layer_id][phys_pages_clamped]
         k_max = self.page_k_max[layer_id][phys_pages_clamped]
         valid_mask = self.page_valid[layer_id][phys_pages_clamped] & (

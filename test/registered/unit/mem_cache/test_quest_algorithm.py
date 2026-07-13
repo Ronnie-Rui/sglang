@@ -7,6 +7,7 @@ server or call a real attention backend.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -498,9 +499,144 @@ class TestQuestRetrieveTopkEquivalence(CustomTestCase):
             )
         batched.assert_called_once()
 
+    def test_jit_topk_plan_accepts_string_device_and_preserves_short_dtype(self):
+        pool_seq_lens = torch.tensor([2048], dtype=torch.int64, device=self.device)
+        algo, _ = _make_algorithm(
+            batch_size=1,
+            seq_lens=pool_seq_lens,
+            page_size=1,
+            sparsity_ratio=0.062124249,
+            num_recent_pages=4,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+        )
+        req_pool_indices = torch.zeros(1, dtype=torch.long, device=self.device)
+        sparse_mask = torch.ones(1, dtype=torch.bool, device=self.device)
+
+        # ModelRunner currently passes the device as the string "cuda". Keep
+        # tensor construction on CPU here while exercising that representation.
+        algo.device = "cuda"
+        forward_batch = _FakeForwardBatch(
+            torch.tensor([640], dtype=torch.int64, device=self.device)
+        )
+        algo.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            self.device,
+            fixed_capacity=640,
+        )
+        self.assertEqual(algo._retrieval_plan.k_per_req.dtype, torch.int64)
+
+        forward_batch = _FakeForwardBatch(
+            torch.tensor([1024], dtype=torch.int64, device=self.device)
+        )
+        algo.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            self.device,
+            fixed_capacity=1024,
+        )
+        self.assertEqual(algo._retrieval_plan.k_per_req.dtype, torch.int32)
+
+        # This ratio rounds 1143 * ratio down in Python double but up to 279
+        # in float32. max_k must remain a safe upper bound for the device k.
+        algo.sparsity_ratio = 0.244094488
+        forward_batch = _FakeForwardBatch(
+            torch.tensor([1147], dtype=torch.int64, device=self.device)
+        )
+        algo.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            self.device,
+            fixed_capacity=1147,
+        )
+        plan = algo._retrieval_plan
+        self.assertEqual(plan.k_per_req.tolist(), [279])
+        self.assertEqual(plan.max_k, 279)
+        self.assertLessEqual(plan.k_per_req.max().item(), plan.max_k)
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestQuestFixedCapacityCudaGraph(unittest.TestCase):
+    @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
+    def test_torch_topk_uses_direct_flashattention_metadata(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        seq_lens = torch.tensor([600, 511], dtype=torch.int64, device=device)
+        algo, k_buffer = _make_algorithm(
+            batch_size=2,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.062124249,
+            num_recent_pages=4,
+            kv_heads=1,
+            head_dim=8,
+            device=device,
+            seed=19,
+        )
+        _populate_page_reps(algo, 2, seq_lens, k_buffer, device)
+        forward_batch = _FakeForwardBatch(seq_lens)
+        req_pool_indices = torch.arange(2, dtype=torch.long, device=device)
+        sparse_mask = torch.ones(2, dtype=torch.bool, device=device)
+        queries = torch.randn((2, 1, 8), device=device)
+        algo.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            device,
+            fixed_capacity=640,
+        )
+        plan = algo._retrieval_plan
+        self.assertEqual(plan.k_per_req.dtype, torch.int64)
+        self.assertLess(plan.max_num_pages, 1024)
+
+        width = plan.max_k + algo.num_recent_pages
+        attn_metadata = SimpleNamespace(
+            page_table=torch.full((2, width), -99, dtype=torch.int32, device=device),
+            cache_seqlens_int32=torch.empty(2, dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.empty(3, dtype=torch.int32, device=device),
+        )
+        direct_pages, direct_lengths, metadata_prepared = algo.retrieve_topk(
+            queries,
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+            attn_metadata=attn_metadata,
+        )
+        self.assertTrue(metadata_prepared)
+
+        algo.use_direct_fa_metadata_kernel = False
+        fallback_indices, fallback_lengths = algo.retrieve_topk(
+            queries,
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )
+        fallback_pages = algo.get_selected_physical_pages(fallback_indices)
+        torch.testing.assert_close(direct_lengths, fallback_lengths)
+        for row, length in enumerate(fallback_lengths.tolist()):
+            torch.testing.assert_close(
+                direct_pages[row, :length], fallback_pages[row, :length]
+            )
+
+        expected_cache_lengths = fallback_lengths.to(torch.int32)
+        expected_cu_seqlens = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=device),
+                expected_cache_lengths.cumsum(0, dtype=torch.int32),
+            ]
+        )
+        torch.testing.assert_close(
+            attn_metadata.cache_seqlens_int32, expected_cache_lengths
+        )
+        torch.testing.assert_close(attn_metadata.cu_seqlens_k, expected_cu_seqlens)
+
     @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
     def test_triton_finalize_matches_torch_and_replays(self):
         from sglang.srt.mem_cache.sparsity.kernels.quest_finalize import (

@@ -10,9 +10,12 @@ def _quest_page_score_kernel(
     page_k_max_ptr,
     page_valid_ptr,
     physical_pages_ptr,
+    active_mask_ptr,
+    history_page_counts_ptr,
     output_ptr,
     num_pages,
     num_pool_pages,
+    APPLY_RETRIEVAL_MASK: tl.constexpr,
     Q_HEADS: tl.constexpr,
     KV_HEADS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
@@ -23,13 +26,18 @@ def _quest_page_score_kernel(
     batch_idx = tl.program_id(1)
     physical_page_raw = tl.load(physical_pages_ptr + batch_idx * num_pages + page_idx)
     page_in_bounds = (physical_page_raw >= 0) & (physical_page_raw < num_pool_pages)
+    page_is_selected = page_in_bounds
+    if APPLY_RETRIEVAL_MASK:
+        request_is_active = tl.load(active_mask_ptr + batch_idx).to(tl.int1)
+        history_page_count = tl.load(history_page_counts_ptr + batch_idx)
+        page_is_selected &= request_is_active & (page_idx < history_page_count)
     physical_page = tl.where(page_in_bounds, physical_page_raw, 0)
     page_is_valid = tl.load(
-        page_valid_ptr + physical_page, mask=page_in_bounds, other=0
+        page_valid_ptr + physical_page, mask=page_is_selected, other=0
     )
 
     dim_offsets = tl.arange(0, BLOCK_D)
-    dim_mask = (dim_offsets < HEAD_DIM) & page_in_bounds & page_is_valid
+    dim_mask = (dim_offsets < HEAD_DIM) & page_is_selected & page_is_valid
     best_bound = -float("inf")
 
     for kv_head in range(KV_HEADS):
@@ -55,7 +63,7 @@ def _quest_page_score_kernel(
             head_bound = tl.sum(query * bound_keys, axis=0)
             best_bound = tl.maximum(best_bound, head_bound)
 
-    score = tl.where(page_in_bounds & page_is_valid, best_bound, -float("inf"))
+    score = tl.where(page_is_selected & page_is_valid, best_bound, -float("inf"))
     tl.store(output_ptr + batch_idx * num_pages + page_idx, score)
 
 
@@ -65,10 +73,15 @@ def quest_page_scores(
     page_k_max: torch.Tensor,
     page_valid: torch.Tensor,
     physical_pages: torch.Tensor,
+    *,
+    active_mask: torch.Tensor | None = None,
+    history_page_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute Quest's conservative per-page GQA bound without intermediates.
 
-    Out-of-range physical pages are masked to ``-inf``. The representation
+    Out-of-range physical pages are masked to ``-inf``. When ``active_mask``
+    and ``history_page_counts`` are provided, inactive requests and logical
+    recent/padding pages are masked in the same kernel. The representation
     tensors are persistent contiguous pools in Quest; they are deliberately
     not copied here because doing so would dominate scoring.
     """
@@ -102,6 +115,32 @@ def quest_page_scores(
         for tensor in (page_k_min, page_k_max, page_valid, physical_pages)
     ):
         raise ValueError("Quest score tensors must be on the same CUDA device")
+
+    apply_retrieval_mask = active_mask is not None or history_page_counts is not None
+    if apply_retrieval_mask:
+        if active_mask is None or history_page_counts is None:
+            raise ValueError(
+                "Quest active mask and history page counts must be provided together"
+            )
+        if (
+            active_mask.shape != (physical_pages.shape[0],)
+            or active_mask.dtype != torch.bool
+        ):
+            raise ValueError("Quest active mask must be bool with shape [batch]")
+        if history_page_counts.shape != (
+            physical_pages.shape[0],
+        ) or history_page_counts.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError(
+                "Quest history page counts must be int32/int64 with shape [batch]"
+            )
+        if (
+            active_mask.device != queries.device
+            or history_page_counts.device != queries.device
+        ):
+            raise ValueError("Quest retrieval masks must share the score tensor device")
 
     num_pool_pages, kv_heads, head_dim = page_k_min.shape
     if kv_heads <= 0 or head_dim <= 0:
@@ -143,6 +182,11 @@ def quest_page_scores(
         queries = queries.contiguous()
     if not physical_pages.is_contiguous():
         physical_pages = physical_pages.contiguous()
+    if apply_retrieval_mask:
+        if not active_mask.is_contiguous():
+            active_mask = active_mask.contiguous()
+        if not history_page_counts.is_contiguous():
+            history_page_counts = history_page_counts.contiguous()
 
     num_pages = physical_pages.shape[1]
     output = torch.empty(
@@ -154,15 +198,22 @@ def quest_page_scores(
         raise ValueError("Quest page representation pool cannot be empty")
 
     block_d = triton.next_power_of_2(head_dim)
+    active_mask_arg = active_mask if apply_retrieval_mask else physical_pages
+    history_page_counts_arg = (
+        history_page_counts if apply_retrieval_mask else physical_pages
+    )
     _quest_page_score_kernel[(num_pages, batch_size)](
         queries,
         page_k_min,
         page_k_max,
         page_valid,
         physical_pages,
+        active_mask_arg,
+        history_page_counts_arg,
         output,
         num_pages,
         num_pool_pages,
+        APPLY_RETRIEVAL_MASK=apply_retrieval_mask,
         Q_HEADS=query_heads,
         KV_HEADS=kv_heads,
         GROUP_SIZE=query_heads // kv_heads,

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from ctypes import c_float
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -6,6 +7,13 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def _float32_scaled_count(count: int, ratio: float) -> int:
+    """Match the device's float32 multiply followed by integer truncation."""
+    count_f32 = c_float(count).value
+    ratio_f32 = c_float(ratio).value
+    return int(c_float(count_f32 * ratio_f32).value)
 
 
 @dataclass
@@ -32,6 +40,7 @@ class _RetrievalPlan:
     max_k: int
     score_order_required: bool
     recent_idx: torch.Tensor
+    recent_idx_i32: torch.Tensor | None
     recent_valid: torch.Tensor
     fixed_capacity: bool
 
@@ -445,6 +454,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             queries,
             layer_id,
             plan,
+            attn_metadata=kwargs.get("attn_metadata"),
         )
 
     def _build_retrieval_plan(
@@ -528,7 +538,10 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             history_capacity = max(max_num_pages - self.num_recent_pages, 0)
             max_k = (
                 min(
-                    max(int(history_capacity * self.sparsity_ratio), 1),
+                    max(
+                        _float32_scaled_count(history_capacity, self.sparsity_ratio),
+                        1,
+                    ),
                     history_capacity,
                 )
                 if history_capacity > 0
@@ -543,7 +556,13 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
                     continue
                 history_count = count - self.num_recent_pages
                 k_per_req_cpu.append(
-                    min(max(int(history_count * self.sparsity_ratio), 1), history_count)
+                    min(
+                        max(
+                            _float32_scaled_count(history_count, self.sparsity_ratio),
+                            1,
+                        ),
+                        history_count,
+                    )
                 )
             max_k = max(k_per_req_cpu, default=0)
             positive_k = {k for k in k_per_req_cpu if k > 0}
@@ -552,10 +571,25 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             max_k = int(k_per_req.max().item()) if bs > 0 else 0
             score_order_required = True
 
+        if (
+            getattr(self, "use_jit_topk_kernel", False)
+            and fixed_capacity
+            and torch.device(self.device).type == "cuda"
+            and torch.version.hip is None
+            and 1024 <= max_num_pages <= 8192
+            and max_k <= 2048
+        ):
+            k_per_req = k_per_req.to(torch.int32)
+
         recent_offsets = torch.arange(
             self.num_recent_pages, device=device, dtype=torch.long
         )
         recent_idx = recent_start.unsqueeze(1) + recent_offsets.unsqueeze(0)
+        recent_idx_i32 = (
+            recent_idx.to(torch.int32)
+            if k_per_req.dtype == torch.int32 and bool(fixed_capacity)
+            else None
+        )
         recent_valid = active_mask.unsqueeze(1) & (recent_idx < num_pages.unsqueeze(1))
         return _RetrievalPlan(
             forward_batch=forward_batch,
@@ -578,6 +612,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             max_k=max_k,
             score_order_required=score_order_required,
             recent_idx=recent_idx,
+            recent_idx_i32=recent_idx_i32,
             recent_valid=recent_valid,
             fixed_capacity=bool(fixed_capacity),
         )
@@ -666,36 +701,147 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         queries: torch.Tensor,
         layer_id: int,
         plan: _RetrievalPlan,
+        *,
+        attn_metadata=None,
     ) -> tuple:
         """Vectorized retrieval for batches, including ragged sequence lengths."""
         bs, device = queries.shape[0], queries.device
         if plan.max_num_pages <= self.num_recent_pages:
             return self._empty_retrieval(bs, device)
 
+        scores = self._retrieve_page_scores_batched(layer_id, queries, plan)
+
+        if plan.max_k <= 0:
+            return self._empty_retrieval(bs, device)
+
+        use_jit_topk = (
+            getattr(self, "use_jit_topk_kernel", False)
+            and plan.fixed_capacity
+            and scores.is_cuda
+            and torch.version.hip is None
+            and scores.dtype == torch.float32
+            and plan.k_per_req.dtype == torch.int32
+            and 1024 <= scores.shape[1] <= 8192
+            and plan.max_k <= 2048
+            and scores.stride(1) == 1
+            and (scores.shape[0] <= 1 or scores.stride(0) % 4 == 0)
+        )
+        if use_jit_topk:
+            from sglang.jit_kernel.quest.topk import quest_topk
+
+            # The JIT kernel selects each row's exact k_per_req, so its output
+            # need not be score-sorted to make a ragged prefix valid.
+            topk_scores, topk_idx = quest_topk(scores, plan.k_per_req, plan.max_k)
+        else:
+            topk_scores, topk_idx = torch.topk(
+                scores,
+                k=plan.max_k,
+                dim=1,
+                sorted=plan.score_order_required,
+            )
+
+        direct_result = self._try_finalize_to_flashattention_metadata(
+            topk_scores,
+            topk_idx,
+            plan,
+            attn_metadata,
+            layer_id,
+        )
+        if direct_result is not None:
+            return direct_result
+        return self._finalize_topk_with_recent(topk_scores, topk_idx, plan)
+
+    def _retrieve_page_scores_batched(
+        self,
+        layer_id: int,
+        queries: torch.Tensor,
+        plan: _RetrievalPlan,
+    ) -> torch.Tensor:
+        """Score and mask batched pages, allowing algorithms to fuse the mask."""
         scores = self._retrieve_page_scores(
             layer_id,
             plan.physical_pages,
             plan.req_pool_indices,
             queries,
         )
-
         score_mask = (
             plan.active_mask.unsqueeze(1)
             & plan.valid_page_mask
             & plan.history_page_mask
         )
-        scores = torch.where(score_mask, scores, torch.full_like(scores, float("-inf")))
+        return torch.where(score_mask, scores, torch.full_like(scores, float("-inf")))
 
-        if plan.max_k <= 0:
-            return self._empty_retrieval(bs, device)
+    def _try_finalize_to_flashattention_metadata(
+        self,
+        topk_scores: torch.Tensor,
+        topk_idx: torch.Tensor,
+        plan: _RetrievalPlan,
+        attn_metadata,
+        layer_id: int,
+    ) -> tuple | None:
+        if (
+            not getattr(self, "use_direct_fa_metadata_kernel", False)
+            or attn_metadata is None
+            or not plan.fixed_capacity
+            or not topk_scores.is_cuda
+            or torch.version.hip is not None
+            or topk_scores.dtype != torch.float32
+            or topk_idx.dtype not in (torch.int32, torch.int64)
+            or plan.k_per_req.dtype not in (torch.int32, torch.int64)
+            or plan.max_num_pages > 0x7FFFFFFE
+        ):
+            return None
 
-        topk_scores, topk_idx = torch.topk(
-            scores,
-            k=plan.max_k,
-            dim=1,
-            sorted=plan.score_order_required,
+        required_attrs = (
+            "page_table",
+            "cache_seqlens_int32",
+            "cu_seqlens_k",
         )
-        return self._finalize_topk_with_recent(topk_scores, topk_idx, plan)
+        if not all(hasattr(attn_metadata, attr) for attr in required_attrs):
+            return None
+
+        recent_indices = (
+            plan.recent_idx_i32 if plan.recent_idx_i32 is not None else plan.recent_idx
+        )
+        combined_width = topk_scores.shape[1] + recent_indices.shape[1]
+        from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
+            QUEST_DIRECT_METADATA_MAX_WIDTH,
+            quest_finalize_to_flashattention_metadata_,
+        )
+
+        if (
+            combined_width > QUEST_DIRECT_METADATA_MAX_WIDTH
+            or attn_metadata.page_table.shape[0] != plan.batch_size
+            or attn_metadata.page_table.shape[1] < combined_width
+            or not attn_metadata.page_table.is_cuda
+            or not attn_metadata.cache_seqlens_int32.is_cuda
+            or not attn_metadata.cu_seqlens_k.is_cuda
+        ):
+            return None
+
+        valid_lengths = torch.empty(
+            plan.batch_size, dtype=torch.int32, device=topk_scores.device
+        )
+        quest_finalize_to_flashattention_metadata_(
+            topk_scores=topk_scores,
+            topk_indices=topk_idx,
+            k_per_req=plan.k_per_req,
+            recent_indices=recent_indices,
+            recent_valid=plan.recent_valid,
+            valid_lengths=valid_lengths,
+            sparse_mask=plan.sparse_mask,
+            seq_lens=plan.seq_lens,
+            req_pool_indices=plan.req_pool_indices,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            page_table=attn_metadata.page_table,
+            cache_seqlens_int32=attn_metadata.cache_seqlens_int32,
+            cu_seqlens_k=attn_metadata.cu_seqlens_k,
+            page_size=self.page_size,
+            update_lengths=layer_id == self.start_layer,
+        )
+
+        selected_physical_pages = attn_metadata.page_table[:, :combined_width]
+        return selected_physical_pages, valid_lengths, True
 
     def _finalize_topk_with_recent(
         self,

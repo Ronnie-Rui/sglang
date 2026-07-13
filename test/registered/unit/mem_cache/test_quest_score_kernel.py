@@ -14,6 +14,8 @@ def _reference_scores(
     page_k_max: torch.Tensor,
     page_valid: torch.Tensor,
     physical_pages: torch.Tensor,
+    active_mask: torch.Tensor | None = None,
+    history_page_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     k_min = page_k_min[physical_pages]
     k_max = page_k_max[physical_pages]
@@ -29,6 +31,13 @@ def _reference_scores(
         query * k_min.unsqueeze(3),
     ).sum(dim=-1)
     scores = bounds.amax(dim=(2, 3))
+    if active_mask is not None:
+        page_idx = torch.arange(physical_pages.shape[1], device=physical_pages.device)
+        valid = (
+            valid
+            & active_mask.unsqueeze(1)
+            & (page_idx.unsqueeze(0) < history_page_counts.unsqueeze(1))
+        )
     return torch.where(valid, scores, torch.full_like(scores, float("-inf")))
 
 
@@ -140,6 +149,64 @@ class TestQuestScoreKernel(unittest.TestCase):
 
         self.assertEqual(empty_batch.shape, (0, 3))
         self.assertEqual(empty_pages.shape, (2, 0))
+
+    def test_fuses_retrieval_mask_and_replays_graph(self):
+        torch.manual_seed(17)
+        device = torch.device("cuda")
+        batch_size, num_pool_pages = 3, 13
+        queries = torch.randn((batch_size, 4, 16), device=device)
+        page_k_min = torch.randn((num_pool_pages, 2, 16), device=device)
+        page_k_max = page_k_min + torch.rand_like(page_k_min)
+        page_valid = torch.ones(num_pool_pages, dtype=torch.bool, device=device)
+        page_valid[5] = False
+        physical_pages = torch.tensor(
+            [[0, 1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1, 0], [7, 8, 9, 10, 11, 12, 0]],
+            dtype=torch.int64,
+            device=device,
+        )
+        active_mask = torch.tensor([True, False, True], device=device)
+        history_page_counts = torch.tensor([4, 6, 0], device=device)
+
+        def score():
+            return quest_page_scores(
+                queries,
+                page_k_min,
+                page_k_max,
+                page_valid,
+                physical_pages,
+                active_mask=active_mask,
+                history_page_counts=history_page_counts,
+            )
+
+        actual = score()
+        expected = _reference_scores(
+            queries,
+            page_k_min,
+            page_k_max,
+            page_valid,
+            physical_pages,
+            active_mask,
+            history_page_counts,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-3)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = score()
+        active_mask.copy_(torch.tensor([False, True, True], device=device))
+        history_page_counts.copy_(torch.tensor([7, 3, 5], device=device))
+        graph.replay()
+        torch.cuda.synchronize()
+        replay_expected = _reference_scores(
+            queries,
+            page_k_min,
+            page_k_max,
+            page_valid,
+            physical_pages,
+            active_mask,
+            history_page_counts,
+        )
+        torch.testing.assert_close(captured, replay_expected, rtol=2e-4, atol=2e-3)
 
     def test_rejects_noncontiguous_representation_pool(self):
         device = torch.device("cuda")
