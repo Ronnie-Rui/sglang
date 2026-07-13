@@ -3166,6 +3166,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ret = self.eager_runner.execute(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
+                if (
+                    forward_batch.forward_mode.is_decode()
+                    and self.runtime_sparse_coordinator is not None
+                ):
+                    self.runtime_sparse_coordinator.finalize_forward(forward_batch)
 
             if (
                 forward_batch.global_num_tokens_cpu is not None

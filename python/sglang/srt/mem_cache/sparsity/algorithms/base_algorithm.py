@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from ctypes import c_float
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -80,6 +80,21 @@ class BaseSparseAlgorithm(ABC):
     def should_update_representations(self, forward_batch: "ForwardBatch") -> bool:
         """Return whether this decode forward may have completed a page."""
         return True
+
+    def finalize_forward(self, forward_batch: "ForwardBatch") -> None:
+        """Finalize algorithm state after all attention layers have run."""
+
+    def should_finalize_graph_forward(self, forward_batch: "ForwardBatch") -> bool:
+        """Return whether graph replay captured this algorithm's forward path."""
+        return False
+
+    def get_layer_sparsity_ratio(self, layer_id: int) -> float:
+        """Return the history-page keep ratio for one attention layer."""
+        return self.sparsity_ratio
+
+    def should_update_metadata_lengths(self, layer_id: int) -> bool:
+        """Return whether this layer changes sparse sequence lengths."""
+        return layer_id == getattr(self, "start_layer", layer_id)
 
     def get_selected_physical_pages(
         self, selected_indices: torch.Tensor
@@ -225,6 +240,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         self.num_recent_pages = config.sparse_extra_config.get("num_recent_pages", 4)
         self.page_size = config.page_size
         self._retrieval_plan: _RetrievalPlan | None = None
+        self._retrieval_plans_by_ratio: dict[float, _RetrievalPlan] = {}
         self._representation_update_batch = None
         self._representation_update_due: bool | None = None
 
@@ -237,6 +253,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         fixed_capacity: bool | int = False,
     ) -> None:
         """Cache decode metadata that is identical across attention layers."""
+        self._retrieval_plans_by_ratio.clear()
         self._representation_update_batch = forward_batch
         if self.req_to_token_pool is None:
             self._retrieval_plan = None
@@ -251,6 +268,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             device,
             fixed_capacity=fixed_capacity,
         )
+        self._retrieval_plans_by_ratio[self.sparsity_ratio] = self._retrieval_plan
         self._representation_update_due = self._has_completed_page(
             self._retrieval_plan.seq_lens_cpu
         )
@@ -442,12 +460,17 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
                 device,
             )
             self._retrieval_plan = plan
+            self._retrieval_plans_by_ratio = {self.sparsity_ratio: plan}
+
+        layer_ratio = self.get_layer_sparsity_ratio(layer_id)
+        plan = self._get_retrieval_plan_for_ratio(plan, layer_ratio)
 
         if bs == 1 and not plan.fixed_capacity:
             return self._retrieve_topk_single(
                 queries,
                 layer_id,
                 plan,
+                attn_metadata=kwargs.get("attn_metadata"),
             )
 
         return self._retrieve_topk_batched(
@@ -526,60 +549,14 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         active_mask = sparse_mask & (num_pages > self.num_recent_pages)
         recent_start = (num_pages - self.num_recent_pages).clamp(min=0)
         history_page_mask = page_idx.unsqueeze(0) < recent_start.unsqueeze(1)
-        history_pages = recent_start.clamp(min=1)
-        k_per_req = (history_pages.to(torch.float32) * self.sparsity_ratio).to(
-            torch.long
+        k_per_req, max_k, score_order_required = self._build_selection_budget(
+            active_mask=active_mask,
+            recent_start=recent_start,
+            num_pages_cpu=num_pages_cpu,
+            max_num_pages=max_num_pages,
+            fixed_capacity=bool(fixed_capacity),
+            ratio=self.sparsity_ratio,
         )
-        k_per_req = torch.maximum(k_per_req, torch.ones_like(k_per_req))
-        k_per_req = torch.minimum(k_per_req, history_pages)
-        k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
-
-        if fixed_capacity:
-            history_capacity = max(max_num_pages - self.num_recent_pages, 0)
-            max_k = (
-                min(
-                    max(
-                        _float32_scaled_count(history_capacity, self.sparsity_ratio),
-                        1,
-                    ),
-                    history_capacity,
-                )
-                if history_capacity > 0
-                else 0
-            )
-            score_order_required = True
-        elif num_pages_cpu is not None:
-            k_per_req_cpu = []
-            for count in num_pages_cpu:
-                if count <= self.num_recent_pages:
-                    k_per_req_cpu.append(0)
-                    continue
-                history_count = count - self.num_recent_pages
-                k_per_req_cpu.append(
-                    min(
-                        max(
-                            _float32_scaled_count(history_count, self.sparsity_ratio),
-                            1,
-                        ),
-                        history_count,
-                    )
-                )
-            max_k = max(k_per_req_cpu, default=0)
-            positive_k = {k for k in k_per_req_cpu if k > 0}
-            score_order_required = len(positive_k) > 1
-        else:
-            max_k = int(k_per_req.max().item()) if bs > 0 else 0
-            score_order_required = True
-
-        if (
-            getattr(self, "use_jit_topk_kernel", False)
-            and fixed_capacity
-            and torch.device(self.device).type == "cuda"
-            and torch.version.hip is None
-            and 1024 <= max_num_pages <= 8192
-            and max_k <= 2048
-        ):
-            k_per_req = k_per_req.to(torch.int32)
 
         recent_offsets = torch.arange(
             self.num_recent_pages, device=device, dtype=torch.long
@@ -616,6 +593,105 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             recent_valid=recent_valid,
             fixed_capacity=bool(fixed_capacity),
         )
+
+    def _build_selection_budget(
+        self,
+        *,
+        active_mask: torch.Tensor,
+        recent_start: torch.Tensor,
+        num_pages_cpu: list[int] | None,
+        max_num_pages: int,
+        fixed_capacity: bool,
+        ratio: float,
+    ) -> tuple[torch.Tensor, int, bool]:
+        """Build the dynamic per-request k and its static output-width bound."""
+        history_pages = recent_start.clamp(min=1)
+        k_per_req = (history_pages.to(torch.float32) * ratio).to(torch.long)
+        k_per_req = torch.maximum(k_per_req, torch.ones_like(k_per_req))
+        k_per_req = torch.minimum(k_per_req, history_pages)
+        k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
+
+        if fixed_capacity:
+            history_capacity = max(max_num_pages - self.num_recent_pages, 0)
+            max_k = (
+                min(
+                    max(
+                        _float32_scaled_count(history_capacity, ratio),
+                        1,
+                    ),
+                    history_capacity,
+                )
+                if history_capacity > 0
+                else 0
+            )
+            score_order_required = True
+        elif num_pages_cpu is not None:
+            k_per_req_cpu = []
+            for count in num_pages_cpu:
+                if count <= self.num_recent_pages:
+                    k_per_req_cpu.append(0)
+                    continue
+                history_count = count - self.num_recent_pages
+                k_per_req_cpu.append(
+                    min(
+                        max(
+                            _float32_scaled_count(history_count, ratio),
+                            1,
+                        ),
+                        history_count,
+                    )
+                )
+            max_k = max(k_per_req_cpu, default=0)
+            positive_k = {k for k in k_per_req_cpu if k > 0}
+            score_order_required = len(positive_k) > 1
+        else:
+            max_k = int(k_per_req.max().item()) if k_per_req.numel() > 0 else 0
+            score_order_required = True
+
+        if (
+            getattr(self, "use_jit_topk_kernel", False)
+            and fixed_capacity
+            and torch.device(self.device).type == "cuda"
+            and torch.version.hip is None
+            and 1024 <= max_num_pages <= 8192
+            and max_k <= 2048
+        ):
+            k_per_req = k_per_req.to(torch.int32)
+
+        return k_per_req, max_k, score_order_required
+
+    def _get_retrieval_plan_for_ratio(
+        self, plan: _RetrievalPlan, ratio: float
+    ) -> _RetrievalPlan:
+        if ratio == self.sparsity_ratio:
+            return plan
+
+        cached_plan = self._retrieval_plans_by_ratio.get(ratio)
+        if cached_plan is not None:
+            return cached_plan
+
+        k_per_req, max_k, score_order_required = self._build_selection_budget(
+            active_mask=plan.active_mask,
+            recent_start=plan.recent_start,
+            num_pages_cpu=plan.num_pages_cpu,
+            max_num_pages=plan.max_num_pages,
+            fixed_capacity=plan.fixed_capacity,
+            ratio=ratio,
+        )
+        recent_idx_i32 = (
+            plan.recent_idx.to(torch.int32)
+            if k_per_req.dtype == torch.int32 and plan.fixed_capacity
+            else None
+        )
+        cached_plan = replace(
+            plan,
+            k_per_req=k_per_req,
+            max_k=max_k,
+            score_order_required=score_order_required,
+            recent_idx_i32=recent_idx_i32,
+        )
+        self._retrieval_plans_by_ratio[ratio] = cached_plan
+        return cached_plan
 
     @staticmethod
     def _get_seq_lens_cpu(forward_batch, bs: int):
@@ -668,6 +744,8 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         queries: torch.Tensor,
         layer_id: int,
         plan: _RetrievalPlan,
+        *,
+        attn_metadata=None,
     ) -> tuple:
         """Low-overhead path for the latency-sensitive single-request case."""
         device = queries.device
@@ -683,6 +761,15 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         )
 
         recent_start = num_pages - self.num_recent_pages
+        fused_direct_result = self._try_topk_to_flashattention_metadata(
+            scores[:, :recent_start],
+            plan,
+            attn_metadata,
+            layer_id,
+        )
+        if fused_direct_result is not None:
+            return fused_direct_result
+
         k = plan.max_k
         topk_scores, topk_idx = torch.topk(
             scores[:, :recent_start], k=k, dim=1, sorted=False
@@ -713,6 +800,15 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
 
         if plan.max_k <= 0:
             return self._empty_retrieval(bs, device)
+
+        fused_direct_result = self._try_topk_to_flashattention_metadata(
+            scores,
+            plan,
+            attn_metadata,
+            layer_id,
+        )
+        if fused_direct_result is not None:
+            return fused_direct_result
 
         use_jit_topk = (
             getattr(self, "use_jit_topk_kernel", False)
@@ -750,6 +846,102 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if direct_result is not None:
             return direct_result
         return self._finalize_topk_with_recent(topk_scores, topk_idx, plan)
+
+    def _try_topk_to_flashattention_metadata(
+        self,
+        scores: torch.Tensor,
+        plan: _RetrievalPlan,
+        attn_metadata,
+        layer_id: int,
+    ) -> tuple | None:
+        """Fuse exact top-k and fixed-address FA metadata construction.
+
+        Fixed-capacity CUDA graphs retain their existing top-k choice plus
+        direct finalize: torch.topk for the 640 bucket and JIT for 2112.
+        """
+        if (
+            not getattr(self, "use_fused_topk_fa_metadata_kernel", False)
+            or not getattr(self, "use_direct_fa_metadata_kernel", False)
+            or attn_metadata is None
+            or plan.fixed_capacity
+            or not scores.is_cuda
+            or torch.version.hip is not None
+            or scores.dtype != torch.float32
+            or scores.ndim != 2
+            or scores.shape[1] <= 0
+            or scores.shape[1] > 8192
+            or scores.stride(1) != 1
+            or plan.k_per_req.dtype not in (torch.int32, torch.int64)
+            or plan.max_k > 2048
+            or not plan.k_per_req.is_contiguous()
+            or not plan.recent_idx.is_contiguous()
+            or not plan.recent_valid.is_contiguous()
+            or not plan.sparse_mask.is_contiguous()
+            or not plan.seq_lens.is_contiguous()
+            or not plan.req_pool_indices.is_contiguous()
+        ):
+            return None
+
+        required_attrs = (
+            "page_table",
+            "cache_seqlens_int32",
+            "cu_seqlens_k",
+        )
+        if not all(hasattr(attn_metadata, attr) for attr in required_attrs):
+            return None
+
+        page_table = attn_metadata.page_table
+        cache_seqlens = attn_metadata.cache_seqlens_int32
+        cu_seqlens = attn_metadata.cu_seqlens_k
+        recent_indices = (
+            plan.recent_idx_i32 if plan.recent_idx_i32 is not None else plan.recent_idx
+        )
+        combined_width = plan.max_k + recent_indices.shape[1]
+        req_to_token = self.req_to_token_pool.req_to_token
+        if (
+            combined_width <= 0
+            or combined_width > 1024
+            or combined_width > scores.shape[1]
+            or page_table.shape[0] != plan.batch_size
+            or page_table.shape[1] < combined_width
+            or page_table.dtype != torch.int32
+            or cache_seqlens.shape != (plan.batch_size,)
+            or cache_seqlens.dtype != torch.int32
+            or cu_seqlens.shape != (plan.batch_size + 1,)
+            or cu_seqlens.dtype != torch.int32
+            or req_to_token.dtype not in (torch.int32, torch.int64)
+            or any(
+                not tensor.is_cuda
+                for tensor in (page_table, cache_seqlens, cu_seqlens, req_to_token)
+            )
+        ):
+            return None
+
+        from sglang.jit_kernel.quest.topk import (
+            quest_topk_to_flashattention_metadata_out,
+        )
+
+        valid_lengths = torch.empty(
+            plan.batch_size, dtype=torch.int32, device=scores.device
+        )
+        quest_topk_to_flashattention_metadata_out(
+            scores=scores,
+            k_per_req=plan.k_per_req,
+            recent_indices=recent_indices,
+            recent_valid=plan.recent_valid,
+            sparse_mask=plan.sparse_mask,
+            seq_lens=plan.seq_lens,
+            req_pool_indices=plan.req_pool_indices,
+            req_to_token=req_to_token,
+            page_table=page_table,
+            valid_lengths=valid_lengths,
+            cache_seqlens_int32=cache_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            topk_width=plan.max_k,
+            page_size=self.page_size,
+            update_lengths=self.should_update_metadata_lengths(layer_id),
+        )
+        return page_table[:, :combined_width], valid_lengths, True
 
     def _retrieve_page_scores_batched(
         self,
@@ -837,7 +1029,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             cache_seqlens_int32=attn_metadata.cache_seqlens_int32,
             cu_seqlens_k=attn_metadata.cu_seqlens_k,
             page_size=self.page_size,
-            update_lengths=layer_id == self.start_layer,
+            update_lengths=self.should_update_metadata_lengths(layer_id),
         )
 
         selected_physical_pages = attn_metadata.page_table[:, :combined_width]

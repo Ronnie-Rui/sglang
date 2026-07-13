@@ -149,6 +149,8 @@ class SparseCoordinator:
             self.states,
         )
         self._forward_sparse_mask = None
+        self._last_sparse_layer_id = None
+        self._forward_started = False
 
         logger.info(
             f"SparseCoordinator initialized with sparse algorithm={type(algorithm).__name__}"
@@ -243,6 +245,11 @@ class SparseCoordinator:
             self._forward_sparse_mask = None
             return
 
+        if not isinstance(fixed_capacity, int) or isinstance(fixed_capacity, bool):
+            # A scheduler ForwardBatch can be reused after graph replay. Do not
+            # let its published graph bucket override the new eager plan.
+            forward_batch.runtime_sparse_page_capacity = None
+
         self._forward_sparse_mask = self._compute_sparse_mask(req_pool_indices)
         self.algorithm.begin_forward(
             forward_batch=forward_batch,
@@ -262,25 +269,48 @@ class SparseCoordinator:
         """
         if not forward_batch.forward_mode.is_decode():
             return
+        captured_forward = self.algorithm.should_finalize_graph_forward(forward_batch)
+        if not getattr(self, "_forward_started", False) and not captured_forward:
+            return
 
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
-        if req_pool_indices is None or seq_lens is None:
+        if (
+            req_pool_indices is not None
+            and seq_lens is not None
+            and self.algorithm.should_update_representations(forward_batch)
+        ):
+            for layer_id in range(self.start_layer, self.end_layer):
+                self.algorithm.update_representations(
+                    layer_id=layer_id,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
+                    forward_batch=forward_batch,
+                )
+
+        # Replay does not execute the Python attention hooks that mark an eager
+        # forward as started. The captured retrieval did run, so force the
+        # matching post-replay tracker finalization.
+        self.finalize_forward(forward_batch, force=True)
+
+    def prepare_graph_forward(self) -> None:
+        """Clear capture-time lifecycle state before one graph replay."""
+        self._forward_started = False
+        self._last_sparse_layer_id = None
+
+    def finalize_forward(
+        self, forward_batch: "ForwardBatch", *, force: bool = False
+    ) -> None:
+        """Finalize tracker state after eager execution or graph replay."""
+        if not force and not self._forward_started:
             return
 
-        # A decode step completes a representation page only at a page
-        # boundary. Gate once before touching any layer buffers.
-        if not self.algorithm.should_update_representations(forward_batch):
-            return
-
-        for layer_id in range(self.start_layer, self.end_layer):
-            self.algorithm.update_representations(
-                layer_id=layer_id,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
-                forward_batch=forward_batch,
-            )
+        try:
+            self.algorithm.finalize_forward(forward_batch)
+        finally:
+            self._forward_started = False
+            self._last_sparse_layer_id = None
 
     def attention_begin(
         self,
@@ -299,9 +329,12 @@ class SparseCoordinator:
         Identify important KV entries via sparse algorithm, load offloaded KVCache if needed,
         and adapt attention metadata for the attention backend.
         """
-        if layer.layer_id == self.start_layer:
+        layer_id = layer.layer_id
+        if self._last_sparse_layer_id is None or layer_id <= self._last_sparse_layer_id:
             self.forward_begin(forward_batch, fixed_capacity=fixed_capacity)
             self.backend_adaptor.save_original_metadata(attn_metadata)
+            self._forward_started = True
+        self._last_sparse_layer_id = layer_id
 
         return self._handle_sparse_retrieve(
             query, layer, forward_batch, attn_metadata, **kwargs
@@ -353,6 +386,9 @@ class SparseCoordinator:
         sparse_mask = self._forward_sparse_mask
         if sparse_mask is None:
             sparse_mask = self._compute_sparse_mask(req_pool_indices)
+        update_metadata_lengths = self.algorithm.should_update_metadata_lengths(
+            layer_id
+        )
         retrieval_result = self.algorithm.retrieve_topk(
             queries=query,
             layer_id=layer_id,
@@ -385,6 +421,7 @@ class SparseCoordinator:
             layer_id=layer.layer_id,
             selected_physical_indices=selected_physical_indices,
             metadata_prepared=metadata_prepared,
+            update_metadata_lengths=update_metadata_lengths,
         )
 
     def _compute_sparse_mask(self, req_pool_indices):

@@ -429,6 +429,78 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "num_recent_pages"):
             parse_runtime_sparse_config(server_args)
 
+    def test_quest_runtime_validates_layer_selection_reuse_interval(self):
+        for invalid_value in ("0", "true", "1.5"):
+            with self.subTest(invalid_value=invalid_value):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=(
+                        '{"algorithm":"quest","backend":"fa3","page_size":16,'
+                        f'"layer_selection_reuse_interval":{invalid_value}}}'
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "layer_selection_reuse_interval"
+                ):
+                    parse_runtime_sparse_config(server_args)
+
+    def test_quest_runtime_validates_layer_page_budget(self):
+        invalid_budgets = (
+            '"not-a-list"',
+            '[{"start_layer":0,"end_layer":4}]',
+            '[{"start_layer":4,"end_layer":4,"scale":0.5}]',
+            '[{"start_layer":0,"end_layer":4,"scale":0}]',
+            (
+                '[{"start_layer":0,"end_layer":4,"scale":0.5},'
+                '{"start_layer":3,"end_layer":8,"scale":0.75}]'
+            ),
+        )
+        for invalid_budget in invalid_budgets:
+            with self.subTest(invalid_budget=invalid_budget):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=(
+                        '{"algorithm":"quest","backend":"fa3","page_size":16,'
+                        f'"layer_page_budget":{invalid_budget}}}'
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "layer_page_budget"):
+                    parse_runtime_sparse_config(server_args)
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            attention_backend="fa3",
+            page_size=16,
+            hisparse_config=(
+                '{"algorithm":"quest","backend":"fa3","page_size":16,'
+                '"layer_selection_reuse_interval":2,'
+                '"layer_page_budget":['
+                '{"start_layer":4,"end_layer":24,"scale":0.5},'
+                '{"start_layer":24,"end_layer":28,"scale":0.75}]}'
+            ),
+        )
+        config = parse_runtime_sparse_config(server_args)
+        self.assertEqual(
+            config.sparse_extra_config["layer_selection_reuse_interval"], 2
+        )
+        self.assertEqual(
+            config.sparse_extra_config["layer_page_budget"],
+            [
+                {"start_layer": 4, "end_layer": 24, "scale": 0.5},
+                {"start_layer": 24, "end_layer": 28, "scale": 0.75},
+            ],
+        )
+
     def test_quest_runtime_rejects_non_boolean_kernel_options(self):
         boolean_options = (
             "use_triton_score_kernel",
@@ -437,6 +509,8 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             "use_jit_topk_kernel",
             "use_triton_page_update_kernel",
             "use_direct_fa_metadata_kernel",
+            "use_fused_topk_fa_metadata_kernel",
+            "use_lazy_page_update_score_kernel",
         )
         for option in boolean_options:
             for invalid_value in ('"false"', "null", "0"):
@@ -464,6 +538,8 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             "use_jit_topk_kernel",
             "use_triton_page_update_kernel",
             "use_direct_fa_metadata_kernel",
+            "use_fused_topk_fa_metadata_kernel",
+            "use_lazy_page_update_score_kernel",
         )
         extra_config = ",".join(f'"{option}":false' for option in boolean_options)
         server_args = ServerArgs(

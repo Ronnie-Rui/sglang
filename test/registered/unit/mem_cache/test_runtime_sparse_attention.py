@@ -191,6 +191,150 @@ class TestFlashAttentionAdaptor(unittest.TestCase):
         self.assertEqual(metadata.cache_seqlens_int32._version, cache_seqlens_version)
         self.assertEqual(metadata.cu_seqlens_k._version, cu_seqlens_version)
 
+    def test_budget_boundary_updates_dynamic_width_and_lengths_in_place(self):
+        adaptor = FlashAttentionAdaptor(torch.device("cpu"))
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32),
+            cache_seqlens_int32=torch.tensor([10, 7], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 10, 17], dtype=torch.int32),
+            max_seq_len_k=10,
+            scheduler_metadata=torch.ones(1, dtype=torch.int32),
+        )
+        pointers = (
+            metadata.page_table.data_ptr(),
+            metadata.cache_seqlens_int32.data_ptr(),
+            metadata.cu_seqlens_k.data_ptr(),
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([10, 7], dtype=torch.int64),
+        )
+        req_to_token = torch.arange(24, dtype=torch.int64).view(2, 12)
+        sparse_mask = torch.tensor([True, False])
+        adaptor.save_original_metadata(metadata)
+
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor([[0, 2], [0, -1]], dtype=torch.int32),
+            valid_lengths=torch.tensor([2, 1], dtype=torch.int32),
+            sparse_mask=sparse_mask,
+            current_metadata=metadata,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=0,
+            update_metadata_lengths=True,
+        )
+        self.assertEqual(metadata.page_table.tolist(), [[0, 2, 2], [3, 4, 5]])
+        self.assertEqual(metadata.cache_seqlens_int32.tolist(), [6, 7])
+        self.assertEqual(metadata.cu_seqlens_k.tolist(), [0, 6, 13])
+
+        versions = (
+            metadata.page_table._version,
+            metadata.cache_seqlens_int32._version,
+            metadata.cu_seqlens_k._version,
+        )
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor([[0, 2], [0, -1]], dtype=torch.int32),
+            valid_lengths=torch.tensor([2, 1], dtype=torch.int32),
+            sparse_mask=sparse_mask,
+            current_metadata=metadata,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=1,
+            metadata_prepared=True,
+            update_metadata_lengths=False,
+        )
+        self.assertEqual(
+            (
+                metadata.page_table._version,
+                metadata.cache_seqlens_int32._version,
+                metadata.cu_seqlens_k._version,
+            ),
+            versions,
+        )
+
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor([[1], [0]], dtype=torch.int32),
+            valid_lengths=torch.tensor([1, 1], dtype=torch.int32),
+            sparse_mask=sparse_mask,
+            current_metadata=metadata,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=1,
+            update_metadata_lengths=True,
+        )
+        self.assertEqual(metadata.page_table.tolist(), [[1, 2, 2], [3, 4, 5]])
+        self.assertEqual(metadata.cache_seqlens_int32.tolist(), [2, 7])
+        self.assertEqual(metadata.cu_seqlens_k.tolist(), [0, 2, 9])
+
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor([[0, 2], [0, -1]], dtype=torch.int32),
+            valid_lengths=torch.tensor([2, 1], dtype=torch.int32),
+            sparse_mask=sparse_mask,
+            current_metadata=metadata,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=2,
+            update_metadata_lengths=True,
+        )
+        self.assertEqual(metadata.page_table.tolist(), [[0, 2, 2], [3, 4, 5]])
+        self.assertEqual(metadata.cache_seqlens_int32.tolist(), [6, 7])
+        self.assertEqual(metadata.cu_seqlens_k.tolist(), [0, 6, 13])
+        self.assertEqual(metadata.max_seq_len_k, 10)
+        self.assertIsNone(metadata.scheduler_metadata)
+        self.assertEqual(
+            (
+                metadata.page_table.data_ptr(),
+                metadata.cache_seqlens_int32.data_ptr(),
+                metadata.cu_seqlens_k.data_ptr(),
+            ),
+            pointers,
+        )
+
+    def test_direct_metadata_state_accepts_budget_width_change(self):
+        adaptor = FlashAttentionAdaptor(torch.device("cpu"))
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+            cache_seqlens_int32=torch.tensor([10], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 10], dtype=torch.int32),
+            max_seq_len_k=10,
+            scheduler_metadata=None,
+        )
+        page_table_ptr = metadata.page_table.data_ptr()
+        adaptor.save_original_metadata(metadata)
+        common_kwargs = {
+            "sparse_mask": torch.tensor([True]),
+            "current_metadata": metadata,
+            "forward_batch": SimpleNamespace(
+                req_pool_indices=torch.tensor([0]),
+                seq_lens=torch.tensor([10]),
+            ),
+            "req_to_token": torch.arange(12).view(1, 12),
+            "page_size": 4,
+            "metadata_prepared": True,
+            "update_metadata_lengths": True,
+        }
+
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=metadata.page_table[:, :2],
+            valid_lengths=torch.tensor([2], dtype=torch.int32),
+            layer_id=0,
+            **common_kwargs,
+        )
+        adaptor.adapt_for_attn_metadata(
+            selected_indices=metadata.page_table[:, :1],
+            valid_lengths=torch.tensor([1], dtype=torch.int32),
+            layer_id=1,
+            **common_kwargs,
+        )
+
+        self.assertEqual(adaptor._max_selected, 1)
+        self.assertEqual(adaptor._valid_lengths.tolist(), [1])
+        self.assertEqual(metadata.page_table.data_ptr(), page_table_ptr)
+
     def test_no_selection_keeps_dense_metadata(self):
         adaptor = FlashAttentionAdaptor(torch.device("cpu"))
         metadata = SimpleNamespace(

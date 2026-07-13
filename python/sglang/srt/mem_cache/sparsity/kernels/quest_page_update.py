@@ -125,6 +125,59 @@ def _quest_advance_page_trackers_kernel(
     tl.store(last_constructed_page_ptr + req_idx, end_page, mask=update)
 
 
+def quest_advance_page_trackers_(
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    repr_constructed: torch.Tensor,
+    last_constructed_page: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Advance Quest trackers through pages complete at ``seq_len``."""
+    if not req_pool_indices.is_cuda or torch.version.hip is not None:
+        raise ValueError("Quest tracker update requires NVIDIA CUDA tensors")
+    if req_pool_indices.ndim != 1 or seq_lens.shape != req_pool_indices.shape:
+        raise ValueError("Quest request indices and sequence lengths must be 1D")
+    if req_pool_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Quest request indices must use int32 or int64")
+    if seq_lens.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Quest sequence lengths must use int32 or int64")
+    if (
+        repr_constructed.ndim != 1
+        or repr_constructed.dtype != torch.bool
+        or not repr_constructed.is_contiguous()
+    ):
+        raise ValueError("Quest constructed tracker must be a contiguous bool vector")
+    if (
+        last_constructed_page.shape != repr_constructed.shape
+        or last_constructed_page.dtype not in (torch.int32, torch.int64)
+        or not last_constructed_page.is_contiguous()
+    ):
+        raise ValueError(
+            "Quest last-page tracker must be a matching contiguous integer vector"
+        )
+    if page_size <= 0:
+        raise ValueError(f"Quest page size must be positive, got {page_size}")
+    if any(
+        tensor.device != req_pool_indices.device
+        for tensor in (seq_lens, repr_constructed, last_constructed_page)
+    ):
+        raise ValueError("Quest tracker update tensors must share one CUDA device")
+
+    batch_size = req_pool_indices.numel()
+    if batch_size == 0:
+        return
+    _quest_advance_page_trackers_kernel[(batch_size,)](
+        req_pool_indices,
+        seq_lens,
+        repr_constructed,
+        last_constructed_page,
+        req_pool_indices.stride(0),
+        seq_lens.stride(0),
+        PAGE_SIZE=page_size,
+        num_warps=1,
+    )
+
+
 def quest_update_page_representations_(
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,

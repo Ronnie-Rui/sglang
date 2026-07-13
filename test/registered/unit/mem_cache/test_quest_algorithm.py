@@ -12,6 +12,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
+    BaseSparseAlgorithmImpl,
+)
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -20,11 +23,14 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _Config:
-    def __init__(self, page_size, sparsity_ratio, num_recent_pages):
+    def __init__(
+        self, page_size, sparsity_ratio, num_recent_pages, sparse_extra_config=None
+    ):
         self.page_size = page_size
         self.sparse_extra_config = {
             "sparsity_ratio": sparsity_ratio,
             "num_recent_pages": num_recent_pages,
+            **(sparse_extra_config or {}),
         }
 
 
@@ -77,6 +83,8 @@ def _make_algorithm(
     head_dim,
     device,
     seed,
+    sparse_extra_config=None,
+    end_layer=1,
 ):
     torch.manual_seed(seed)
     req_to_token, total_tokens = _build_req_to_token(
@@ -85,11 +93,11 @@ def _make_algorithm(
     k_buffer = torch.randn(
         total_tokens, kv_heads, head_dim, dtype=torch.float32, device=device
     )
-    config = _Config(page_size, sparsity_ratio, num_recent_pages)
+    config = _Config(page_size, sparsity_ratio, num_recent_pages, sparse_extra_config)
     algo = QuestAlgorithm(config, device)
     algo.initialize_representation_pool(
         start_layer=0,
-        end_layer=1,
+        end_layer=end_layer,
         token_to_kv_pool=_FakeTokenToKVPool(k_buffer),
         req_to_token_pool=_FakeReqToTokenPool(req_to_token),
         states=_FakeStates(batch_size, device),
@@ -561,8 +569,873 @@ class TestQuestRetrieveTopkEquivalence(CustomTestCase):
         self.assertLessEqual(plan.k_per_req.max().item(), plan.max_k)
 
 
+class TestQuestLayerReuseAndBudget(unittest.TestCase):
+    device = torch.device("cpu")
+
+    @staticmethod
+    def _make_wrapper_algorithm(*, interval=1, layer_page_budget=None):
+        config = _Config(
+            page_size=1,
+            sparsity_ratio=0.062124249,
+            num_recent_pages=1,
+            sparse_extra_config={
+                "layer_selection_reuse_interval": interval,
+                "layer_page_budget": layer_page_budget or [],
+            },
+        )
+        algorithm = QuestAlgorithm(config, torch.device("cpu"))
+        algorithm.start_layer = 1
+        return algorithm
+
+    @staticmethod
+    def _call_retrieve(algorithm, layer_id):
+        return algorithm.retrieve_topk(
+            torch.zeros((1, 1, 1)),
+            layer_id,
+            torch.zeros(1, dtype=torch.long),
+            torch.ones(1, dtype=torch.bool),
+            forward_batch=object(),
+        )
+
+    def test_reuses_only_consecutive_layers_in_same_interval_and_budget(self):
+        algorithm = self._make_wrapper_algorithm(
+            interval=4,
+            layer_page_budget=[{"start_layer": 3, "end_layer": 5, "scale": 0.5}],
+        )
+        algorithm.end_layer = 7
+        selected = torch.tensor([[7]], dtype=torch.int32)
+        lengths = torch.tensor([1], dtype=torch.int32)
+
+        with patch.object(
+            BaseSparseAlgorithmImpl,
+            "retrieve_topk",
+            return_value=(selected, lengths),
+        ) as underlying_retrieve:
+            results = [
+                self._call_retrieve(algorithm, layer_id) for layer_id in range(1, 7)
+            ]
+
+            # Local PP start and budget/relative-interval boundaries are anchors.
+            self.assertEqual(underlying_retrieve.call_count, 3)
+            self.assertEqual(len(results[1]), 3)
+            self.assertTrue(results[1][2])
+            self.assertEqual(len(results[-1]), 3)
+            self.assertTrue(results[-1][2])
+            self.assertTrue(algorithm.should_update_metadata_lengths(1))
+            self.assertTrue(algorithm.should_update_metadata_lengths(3))
+            self.assertTrue(algorithm.should_update_metadata_lengths(5))
+            self.assertFalse(algorithm.should_update_metadata_lengths(4))
+            self.assertTrue(algorithm._is_selection_anchor(1))
+            self.assertTrue(algorithm._is_selection_anchor(3))
+            self.assertTrue(algorithm._is_selection_anchor(5))
+            self.assertFalse(algorithm._is_selection_anchor(6))
+
+            with patch.object(BaseSparseAlgorithmImpl, "begin_forward"):
+                algorithm.begin_forward()
+            self._call_retrieve(algorithm, 1)
+            self.assertEqual(underlying_retrieve.call_count, 4)
+
+    def test_default_interval_and_layer_discontinuity_force_retrieval(self):
+        selected = torch.tensor([[0]], dtype=torch.int32)
+        lengths = torch.tensor([1], dtype=torch.int32)
+        with patch.object(
+            BaseSparseAlgorithmImpl,
+            "retrieve_topk",
+            return_value=(selected, lengths),
+        ) as underlying_retrieve:
+            default_algorithm = self._make_wrapper_algorithm()
+            self._call_retrieve(default_algorithm, 1)
+            self._call_retrieve(default_algorithm, 2)
+            self.assertEqual(underlying_retrieve.call_count, 2)
+
+            reuse_algorithm = self._make_wrapper_algorithm(interval=4)
+            reuse_algorithm.start_layer = 0
+            self._call_retrieve(reuse_algorithm, 0)
+            self._call_retrieve(reuse_algorithm, 2)
+            self.assertEqual(underlying_retrieve.call_count, 4)
+
+    def test_lazy_update_reanchors_on_noncontiguous_layer_order(self):
+        algorithm = self._make_wrapper_algorithm(interval=4)
+        algorithm.end_layer = 5
+        algorithm._lazy_page_update_active = True
+        algorithm._retrieval_plan = SimpleNamespace(max_num_pages=4)
+        algorithm.states = _FakeStates(1, self.device)
+
+        selected = torch.tensor([[3]], dtype=torch.int32)
+        lengths = torch.tensor([1], dtype=torch.int32)
+        lazy_updated_layers = []
+
+        def fake_lazy_retrieve(*args, **kwargs):
+            lazy_updated_layers.append(args[1])
+            return selected, lengths
+
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: True),
+            req_pool_indices=torch.zeros(1, dtype=torch.long),
+            seq_lens=torch.tensor([2], dtype=torch.long),
+        )
+        with patch.object(
+            BaseSparseAlgorithmImpl,
+            "retrieve_topk",
+            side_effect=fake_lazy_retrieve,
+        ) as underlying_retrieve:
+            first_result = self._call_retrieve(algorithm, 1)
+            algorithm.update_representations(
+                1,
+                torch.zeros(1, dtype=torch.long),
+                torch.ones(1, dtype=torch.long),
+                torch.zeros((1, 1, 1)),
+                forward_batch,
+            )
+            result = self._call_retrieve(algorithm, 3)
+            algorithm.update_representations(
+                3,
+                torch.zeros(1, dtype=torch.long),
+                torch.ones(1, dtype=torch.long),
+                torch.zeros((1, 1, 1)),
+                forward_batch,
+            )
+
+        self.assertEqual(first_result, (selected, lengths))
+        self.assertEqual(result, (selected, lengths))
+        self.assertEqual(underlying_retrieve.call_count, 2)
+        self.assertEqual(lazy_updated_layers, [1, 3])
+        self.assertTrue(algorithm._lazy_page_update_active)
+        self.assertEqual(algorithm._actual_selection_anchors, {1, 3})
+        self.assertFalse(algorithm.states.repr_constructed[0].item())
+        self.assertEqual(algorithm.states.last_constructed_page[0].item(), 0)
+
+        def fake_lazy_tracker(
+            reqs, seq_lens, constructed, last_page, page_size, *, max_pages
+        ):
+            constructed[reqs] = True
+            last_page[reqs] = torch.clamp(
+                (seq_lens - 1) // page_size, min=0, max=max_pages
+            )
+
+        with patch(
+            "sglang.srt.mem_cache.sparsity.kernels.quest_score."
+            "quest_advance_lazy_page_trackers_",
+            side_effect=fake_lazy_tracker,
+        ) as advance:
+            algorithm.finalize_forward(forward_batch)
+
+        advance.assert_called_once()
+        self.assertEqual(advance.call_args.kwargs["max_pages"], 4)
+        self.assertTrue(algorithm.states.repr_constructed[0].item())
+        self.assertEqual(algorithm.states.last_constructed_page[0].item(), 1)
+
+    def test_noncontiguous_retrieval_refreshes_late_anchor_and_tail_finalizes(self):
+        seq_lens = torch.tensor([2], dtype=torch.int64)
+        algorithm, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+            sparse_extra_config={"layer_selection_reuse_interval": 4},
+            end_layer=4,
+        )
+        req_pool_indices = torch.zeros(1, dtype=torch.long)
+        sparse_mask = torch.ones(1, dtype=torch.bool)
+        forward_batch = _FakeForwardBatch(seq_lens)
+        forward_batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+        forward_batch.req_pool_indices = req_pool_indices
+        algorithm.begin_forward(
+            forward_batch, req_pool_indices, sparse_mask, self.device
+        )
+
+        selected = torch.tensor([[0]], dtype=torch.int32)
+        lengths = torch.tensor([1], dtype=torch.int32)
+        tracker_inputs = []
+
+        def fake_page_update(*args, advance_trackers):
+            tracker_inputs.append((bool(args[4][0].item()), int(args[5][0].item())))
+            args[8].fill_(True)
+            if advance_trackers:
+                args[4][args[0]] = True
+                args[5][args[0]] = args[1] // args[9]
+
+        with (
+            patch.object(
+                BaseSparseAlgorithmImpl,
+                "retrieve_topk",
+                return_value=(selected, lengths),
+            ) as underlying_retrieve,
+            patch.object(algorithm, "_can_use_triton_page_update", return_value=True),
+            patch(
+                "sglang.srt.mem_cache.sparsity.kernels.quest_page_update."
+                "quest_update_page_representations_",
+                side_effect=fake_page_update,
+            ) as page_update,
+        ):
+            algorithm.retrieve_topk(
+                torch.zeros((1, 1, 1)),
+                0,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+            )
+            algorithm.update_representations(
+                0, req_pool_indices, seq_lens, k_buffer, forward_batch
+            )
+
+            # Layer 1 is omitted (for example because its key input is None).
+            # Layer 2 must become a fresh anchor even though it shares group 0.
+            algorithm.retrieve_topk(
+                torch.zeros((1, 1, 1)),
+                2,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+            )
+            algorithm.update_representations(
+                2, req_pool_indices, seq_lens, k_buffer, forward_batch
+            )
+
+            self.assertEqual(page_update.call_count, 2)
+            self.assertTrue(algorithm.page_valid[0].any().item())
+            self.assertTrue(algorithm.page_valid[2].any().item())
+            self.assertFalse(algorithm.states.repr_constructed[0].item())
+            self.assertEqual(algorithm.states.last_constructed_page[0].item(), 0)
+
+            # Numerical tail layer 3 is absent. The runner-level finalizer must
+            # still advance after every actual anchor has written its bounds.
+            algorithm.finalize_forward(forward_batch)
+
+        self.assertEqual(underlying_retrieve.call_count, 2)
+        self.assertEqual(page_update.call_count, 2)
+        self.assertEqual(tracker_inputs, [(False, 0), (False, 0)])
+        self.assertTrue(algorithm.page_valid[0].any().item())
+        self.assertTrue(algorithm.page_valid[2].any().item())
+        self.assertFalse(algorithm.page_valid[1].any().item())
+        self.assertFalse(algorithm.page_valid[3].any().item())
+        self.assertTrue(algorithm.states.repr_constructed[0].item())
+        self.assertEqual(algorithm.states.last_constructed_page[0].item(), 2)
+
+    def test_metadata_lengths_follow_previous_executed_layer(self):
+        algorithm = self._make_wrapper_algorithm(
+            interval=4,
+            layer_page_budget=[{"start_layer": 3, "end_layer": 5, "scale": 0.5}],
+        )
+        algorithm.end_layer = 7
+        selected = torch.tensor([[0]], dtype=torch.int32)
+        lengths = torch.tensor([1], dtype=torch.int32)
+
+        with patch.object(
+            BaseSparseAlgorithmImpl,
+            "retrieve_topk",
+            return_value=(selected, lengths),
+        ):
+            # Layer 1 (the configured PP start) is absent. The first actual
+            # sparse layer must still initialize sequence-length metadata.
+            self.assertTrue(algorithm.should_update_metadata_lengths(2))
+            self._call_retrieve(algorithm, 2)
+            self.assertTrue(algorithm.should_update_metadata_lengths(2))
+
+            # Numeric predecessors 3 and 5 have the same budget as layers 4
+            # and 6 respectively, but neither predecessor actually executed.
+            self.assertTrue(algorithm.should_update_metadata_lengths(4))
+            self._call_retrieve(algorithm, 4)
+            self.assertTrue(algorithm.should_update_metadata_lengths(4))
+            self.assertTrue(algorithm.should_update_metadata_lengths(6))
+            self._call_retrieve(algorithm, 6)
+            self.assertTrue(algorithm.should_update_metadata_lengths(6))
+
+            with patch.object(BaseSparseAlgorithmImpl, "begin_forward"):
+                algorithm.begin_forward()
+            self._call_retrieve(algorithm, 2)
+            self._call_retrieve(algorithm, 6)
+            self.assertFalse(algorithm.should_update_metadata_lengths(6))
+
+    def test_graph_bucket_selects_matching_lazy_tracker_state(self):
+        algorithm = self._make_wrapper_algorithm(interval=2)
+        algorithm.end_layer = 3
+        algorithm.states = _FakeStates(1, self.device)
+        algorithm._lazy_page_update_active = True
+        algorithm._lazy_page_update_graph_states = {
+            4: (False, 4),
+            16: (True, 16),
+        }
+        short_batch = SimpleNamespace(runtime_sparse_page_capacity=4)
+        long_batch = SimpleNamespace(
+            runtime_sparse_page_capacity=16,
+            forward_mode=SimpleNamespace(is_decode=lambda: True),
+        )
+
+        with patch.object(
+            BaseSparseAlgorithmImpl,
+            "should_update_representations",
+            return_value=False,
+        ):
+            self.assertFalse(algorithm.should_update_representations(short_batch))
+            self.assertTrue(algorithm.should_update_representations(long_batch))
+
+        with patch(
+            "sglang.srt.mem_cache.sparsity.kernels.quest_score."
+            "quest_advance_lazy_page_trackers_"
+        ) as advance:
+            long_batch.req_pool_indices = torch.zeros(1, dtype=torch.long)
+            long_batch.seq_lens = torch.tensor([9], dtype=torch.long)
+            algorithm.finalize_forward(long_batch)
+
+        advance.assert_called_once()
+        self.assertEqual(advance.call_args.kwargs["max_pages"], 16)
+
+    def test_graph_finalize_requires_a_captured_capacity_marker(self):
+        algorithm = self._make_wrapper_algorithm(interval=2)
+        algorithm._lazy_page_update_graph_states = {4: (False, 4)}
+
+        self.assertFalse(
+            algorithm.should_finalize_graph_forward(
+                SimpleNamespace(runtime_sparse_page_capacity=None)
+            )
+        )
+        self.assertFalse(
+            algorithm.should_finalize_graph_forward(
+                SimpleNamespace(runtime_sparse_page_capacity=16)
+            )
+        )
+        self.assertTrue(
+            algorithm.should_finalize_graph_forward(
+                SimpleNamespace(runtime_sparse_page_capacity=4)
+            )
+        )
+
+    def test_same_batch_short_long_short_uses_current_lazy_graph_capacity(self):
+        algorithm = self._make_wrapper_algorithm(interval=2)
+        algorithm.end_layer = 3
+        algorithm.states = _FakeStates(1, self.device)
+        algorithm._lazy_page_update_active = True
+        algorithm._lazy_page_update_graph_states = {
+            4: (True, 4),
+            16: (True, 16),
+        }
+        forward_batch = SimpleNamespace(
+            runtime_sparse_page_capacity=4,
+            forward_mode=SimpleNamespace(is_decode=lambda: True),
+            req_pool_indices=torch.zeros(1, dtype=torch.long),
+            seq_lens=torch.tensor([9], dtype=torch.long),
+        )
+
+        with patch(
+            "sglang.srt.mem_cache.sparsity.kernels.quest_score."
+            "quest_advance_lazy_page_trackers_"
+        ) as advance:
+            for capacity, seq_len in ((4, 9), (16, 33), (4, 9)):
+                forward_batch.runtime_sparse_page_capacity = capacity
+                forward_batch.seq_lens.fill_(seq_len)
+                algorithm.finalize_forward(forward_batch)
+
+        self.assertEqual(
+            [call.kwargs["max_pages"] for call in advance.call_args_list],
+            [4, 16, 4],
+        )
+
+    def test_flags_on_cpu_fallback_finalizes_after_numeric_tail_is_skipped(self):
+        seq_lens = torch.tensor([2], dtype=torch.int64)
+        algorithm, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=7,
+            sparse_extra_config={
+                "layer_selection_reuse_interval": 2,
+                "use_fused_topk_fa_metadata_kernel": True,
+                "use_lazy_page_update_score_kernel": True,
+                "use_triton_page_update_kernel": True,
+            },
+            end_layer=4,
+        )
+        req_pool_indices = torch.zeros(1, dtype=torch.long)
+        forward_batch = _FakeForwardBatch(seq_lens)
+        forward_batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+        forward_batch.req_pool_indices = req_pool_indices
+        algorithm.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            torch.ones(1, dtype=torch.bool),
+            self.device,
+        )
+        self.assertFalse(algorithm._lazy_page_update_active)
+
+        for layer_id in (0, 2):
+            algorithm.update_representations(
+                layer_id,
+                req_pool_indices,
+                seq_lens,
+                k_buffer,
+                forward_batch,
+            )
+
+        self.assertFalse(algorithm.states.repr_constructed[0].item())
+        self.assertEqual(algorithm.states.last_constructed_page[0].item(), 0)
+        algorithm.finalize_forward(forward_batch)
+        self.assertTrue(algorithm.states.repr_constructed[0].item())
+        self.assertEqual(algorithm.states.last_constructed_page[0].item(), 2)
+        self.assertTrue(algorithm.page_valid[0].any().item())
+        self.assertTrue(algorithm.page_valid[2].any().item())
+        self.assertFalse(algorithm.page_valid[1].any().item())
+        self.assertFalse(algorithm.page_valid[3].any().item())
+
+    def test_regular_finalize_respects_host_page_boundary_gate(self):
+        seq_lens = torch.tensor([9], dtype=torch.int64)
+        algorithm, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=4,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=11,
+        )
+        req_pool_indices = torch.zeros(1, dtype=torch.long)
+        forward_batch = _FakeForwardBatch(seq_lens)
+        forward_batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+        forward_batch.req_pool_indices = req_pool_indices
+        algorithm.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            torch.ones(1, dtype=torch.bool),
+            self.device,
+        )
+
+        algorithm.update_representations(
+            0, req_pool_indices, seq_lens, k_buffer, forward_batch
+        )
+        algorithm.finalize_forward(forward_batch)
+
+        self.assertFalse(algorithm.states.repr_constructed[0].item())
+        self.assertEqual(algorithm.states.last_constructed_page[0].item(), 0)
+
+    def test_layer_budget_scales_base_ratio_and_static_max_k(self):
+        base_ratio = 0.062124249
+        seq_lens = torch.tensor([1147], dtype=torch.int64)
+        algorithm, _ = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=base_ratio,
+            num_recent_pages=4,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+            sparse_extra_config={
+                "layer_page_budget": [{"start_layer": 0, "end_layer": 1, "scale": 0.5}]
+            },
+        )
+        forward_batch = _FakeForwardBatch(seq_lens)
+        req_pool_indices = torch.zeros(1, dtype=torch.long)
+        sparse_mask = torch.ones(1, dtype=torch.bool)
+        algorithm.device = "cuda"
+        algorithm.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            self.device,
+            fixed_capacity=1147,
+        )
+
+        result = (torch.tensor([[0]], dtype=torch.int32), torch.tensor([1]))
+        with patch.object(
+            algorithm, "_retrieve_topk_batched", return_value=result
+        ) as retrieve:
+            algorithm.retrieve_topk(
+                torch.zeros((1, 1, 1)),
+                0,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+            )
+
+        layer_plan = retrieve.call_args.args[2]
+        effective_ratio = base_ratio * 0.5
+        expected_k = int(
+            (
+                torch.tensor(1143, dtype=torch.float32)
+                * torch.tensor(effective_ratio, dtype=torch.float32)
+            ).item()
+        )
+        self.assertEqual(algorithm.get_layer_sparsity_ratio(0), effective_ratio)
+        self.assertEqual(layer_plan.k_per_req.tolist(), [expected_k])
+        self.assertEqual(layer_plan.max_k, expected_k)
+        self.assertEqual(layer_plan.k_per_req.dtype, torch.int32)
+        self.assertLess(layer_plan.max_k, algorithm._retrieval_plan.max_k)
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestQuestFixedCapacityCudaGraph(unittest.TestCase):
+    @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
+    def test_reuse_updates_only_selection_anchor_representations(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        seq_lens = torch.tensor([8], dtype=torch.int64, device=device)
+        algo, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=4,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=8,
+            device=device,
+            seed=17,
+            sparse_extra_config={"layer_selection_reuse_interval": 2},
+            end_layer=4,
+        )
+        req_pool_indices = torch.zeros(1, dtype=torch.long, device=device)
+        sparse_mask = torch.ones(1, dtype=torch.bool, device=device)
+        forward_batch = _FakeForwardBatch(seq_lens)
+        forward_batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+        forward_batch.req_pool_indices = req_pool_indices
+        algo.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            device,
+        )
+
+        for layer_id in range(4):
+            algo.update_representations(
+                layer_id,
+                req_pool_indices,
+                seq_lens,
+                k_buffer,
+                forward_batch,
+            )
+        algo.finalize_forward(forward_batch)
+        torch.cuda.synchronize()
+
+        self.assertTrue(algo.page_valid[0].any().item())
+        self.assertFalse(algo.page_valid[1].any().item())
+        self.assertTrue(algo.page_valid[2].any().item())
+        self.assertFalse(algo.page_valid[3].any().item())
+        self.assertTrue(algo.states.repr_constructed[0].item())
+        self.assertEqual(algo.states.last_constructed_page[0].item(), 2)
+
+    @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
+    def test_fused_topk_metadata_flag_reaches_production_retrieval(self):
+        from sglang.jit_kernel.quest.topk import (
+            quest_topk_to_flashattention_metadata_out,
+        )
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        seq_lens = torch.tensor([600, 511], dtype=torch.int64, device=device)
+        algo, k_buffer = _make_algorithm(
+            batch_size=2,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.062124249,
+            num_recent_pages=4,
+            kv_heads=1,
+            head_dim=8,
+            device=device,
+            seed=23,
+            sparse_extra_config={"use_fused_topk_fa_metadata_kernel": True},
+        )
+        _populate_page_reps(algo, 2, seq_lens, k_buffer, device)
+        forward_batch = _FakeForwardBatch(seq_lens)
+        req_pool_indices = torch.arange(2, dtype=torch.long, device=device)
+        sparse_mask = torch.ones(2, dtype=torch.bool, device=device)
+        queries = torch.randn((2, 1, 8), device=device)
+        algo.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            device,
+        )
+        width = algo._retrieval_plan.max_k + algo.num_recent_pages
+
+        def make_metadata():
+            return SimpleNamespace(
+                page_table=torch.full(
+                    (2, width), -99, dtype=torch.int32, device=device
+                ),
+                cache_seqlens_int32=torch.empty(2, dtype=torch.int32, device=device),
+                cu_seqlens_k=torch.empty(3, dtype=torch.int32, device=device),
+            )
+
+        fused_metadata = make_metadata()
+        with patch(
+            "sglang.jit_kernel.quest.topk." "quest_topk_to_flashattention_metadata_out",
+            wraps=quest_topk_to_flashattention_metadata_out,
+        ) as fused_kernel:
+            fused_pages, fused_lengths, fused_prepared = algo.retrieve_topk(
+                queries,
+                0,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+                attn_metadata=fused_metadata,
+            )
+        fused_kernel.assert_called_once()
+        self.assertTrue(fused_prepared)
+
+        algo.use_fused_topk_fa_metadata_kernel = False
+        reference_indices, reference_lengths = algo.retrieve_topk(
+            queries,
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )
+        reference_pages = algo.get_selected_physical_pages(reference_indices)
+        torch.testing.assert_close(fused_lengths, reference_lengths, rtol=0, atol=0)
+        for row, length in enumerate(reference_lengths.tolist()):
+            torch.testing.assert_close(
+                fused_pages[row, :length],
+                reference_pages[row, :length],
+                rtol=0,
+                atol=0,
+            )
+        expected_cache_lengths = reference_lengths.to(torch.int32)
+        expected_cu_seqlens = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=device),
+                expected_cache_lengths.cumsum(0, dtype=torch.int32),
+            ]
+        )
+        torch.testing.assert_close(
+            fused_metadata.cache_seqlens_int32,
+            expected_cache_lengths,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            fused_metadata.cu_seqlens_k,
+            expected_cu_seqlens,
+            rtol=0,
+            atol=0,
+        )
+
+    @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
+    def test_lazy_update_score_flag_updates_previous_completed_page(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        seq_lens = torch.tensor([9], dtype=torch.int64, device=device)
+        algo, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=4,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=8,
+            device=device,
+            seed=31,
+            sparse_extra_config={"use_lazy_page_update_score_kernel": True},
+        )
+        req_pool_indices = torch.zeros(1, dtype=torch.long, device=device)
+        algo.states.repr_constructed.fill_(True)
+        algo.states.last_constructed_page.fill_(1)
+        algo._compute_page_representations(
+            0,
+            req_pool_indices,
+            seq_lens,
+            0,
+            torch.ones(1, dtype=torch.long, device=device),
+            k_buffer,
+        )
+        physical_page = int(
+            (
+                algo.req_to_token_pool.req_to_token[0, algo.page_size] // algo.page_size
+            ).item()
+        )
+        self.assertFalse(algo.page_valid[0][physical_page].item())
+
+        forward_batch = _FakeForwardBatch(seq_lens)
+        forward_batch.req_pool_indices = req_pool_indices
+        sparse_mask = torch.ones(1, dtype=torch.bool, device=device)
+        algo.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            device,
+            fixed_capacity=4,
+        )
+        self.assertTrue(algo._lazy_page_update_active)
+        algo.retrieve_topk(
+            torch.randn((1, 1, 8), device=device),
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )
+        self.assertEqual(algo.states.last_constructed_page.item(), 1)
+        forward_batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+        algo.finalize_forward(forward_batch)
+        torch.cuda.synchronize()
+
+        self.assertTrue(algo.page_valid[0][physical_page].item())
+        self.assertEqual(algo.states.last_constructed_page.item(), 2)
+
+    @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
+    def test_lazy_noncontiguous_layers_refresh_both_actual_anchors(self):
+        from sglang.srt.mem_cache.sparsity.kernels.quest_score import (
+            quest_lazy_update_page_scores,
+        )
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        seq_lens = torch.tensor([9], dtype=torch.int64, device=device)
+        algo, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=4,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=8,
+            device=device,
+            seed=41,
+            sparse_extra_config={
+                "layer_selection_reuse_interval": 4,
+                "use_lazy_page_update_score_kernel": True,
+            },
+            end_layer=4,
+        )
+        req_pool_indices = torch.zeros(1, dtype=torch.long, device=device)
+        sparse_mask = torch.ones(1, dtype=torch.bool, device=device)
+        algo.states.repr_constructed.fill_(True)
+        algo.states.last_constructed_page.fill_(1)
+        physical_page = int(
+            (
+                algo.req_to_token_pool.req_to_token[0, algo.page_size] // algo.page_size
+            ).item()
+        )
+        self.assertFalse(algo.page_valid[0][physical_page].item())
+        self.assertFalse(algo.page_valid[2][physical_page].item())
+
+        forward_batch = _FakeForwardBatch(seq_lens)
+        forward_batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+        forward_batch.req_pool_indices = req_pool_indices
+        algo.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            device,
+            fixed_capacity=4,
+        )
+        self.assertTrue(algo._lazy_page_update_active)
+
+        with patch(
+            "sglang.srt.mem_cache.sparsity.kernels.quest_score."
+            "quest_lazy_update_page_scores",
+            wraps=quest_lazy_update_page_scores,
+        ) as lazy_score:
+            algo.retrieve_topk(
+                torch.randn((1, 1, 8), device=device),
+                0,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+            )
+            # Layer 1 is absent; layer 2 must run a fresh lazy score instead of
+            # reusing layer 0 or falling back after scoring stale bounds.
+            algo.retrieve_topk(
+                torch.randn((1, 1, 8), device=device),
+                2,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+            )
+
+        torch.cuda.synchronize()
+        self.assertEqual(lazy_score.call_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["advance_trackers"] is False
+                for call in lazy_score.call_args_list
+            )
+        )
+        self.assertEqual(algo._actual_selection_anchors, {0, 2})
+        self.assertTrue(algo.page_valid[0][physical_page].item())
+        self.assertTrue(algo.page_valid[2][physical_page].item())
+        self.assertEqual(algo.states.last_constructed_page.item(), 1)
+
+        algo.finalize_forward(forward_batch)
+        torch.cuda.synchronize()
+        self.assertEqual(algo.states.last_constructed_page.item(), 2)
+
+    @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
+    def test_fused_topk_metadata_handles_single_request_eager_path(self):
+        from sglang.jit_kernel.quest.topk import (
+            quest_topk_to_flashattention_metadata_out,
+        )
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        seq_lens = torch.tensor([600], dtype=torch.int64, device=device)
+        algo, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.062124249,
+            num_recent_pages=4,
+            kv_heads=1,
+            head_dim=8,
+            device=device,
+            seed=37,
+            sparse_extra_config={"use_fused_topk_fa_metadata_kernel": True},
+        )
+        _populate_page_reps(algo, 1, seq_lens, k_buffer, device)
+        forward_batch = _FakeForwardBatch(seq_lens)
+        req_pool_indices = torch.zeros(1, dtype=torch.long, device=device)
+        sparse_mask = torch.ones(1, dtype=torch.bool, device=device)
+        queries = torch.randn((1, 1, 8), device=device)
+        algo.begin_forward(forward_batch, req_pool_indices, sparse_mask, device)
+        width = algo._retrieval_plan.max_k + algo.num_recent_pages
+        metadata = SimpleNamespace(
+            page_table=torch.full((1, width), -99, dtype=torch.int32, device=device),
+            cache_seqlens_int32=torch.empty(1, dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.empty(2, dtype=torch.int32, device=device),
+        )
+
+        with patch(
+            "sglang.jit_kernel.quest.topk." "quest_topk_to_flashattention_metadata_out",
+            wraps=quest_topk_to_flashattention_metadata_out,
+        ) as fused_kernel:
+            fused_pages, fused_lengths, metadata_prepared = algo.retrieve_topk(
+                queries,
+                0,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+                attn_metadata=metadata,
+            )
+        fused_kernel.assert_called_once()
+        self.assertTrue(metadata_prepared)
+
+        algo.use_fused_topk_fa_metadata_kernel = False
+        reference_indices, reference_lengths = algo.retrieve_topk(
+            queries,
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )
+        reference_pages = algo.get_selected_physical_pages(reference_indices)
+        length = reference_lengths.item()
+        torch.testing.assert_close(fused_lengths, reference_lengths, rtol=0, atol=0)
+        torch.testing.assert_close(
+            fused_pages[0, :length], reference_pages[0, :length], rtol=0, atol=0
+        )
+        self.assertEqual(metadata.cache_seqlens_int32.item(), length)
+        torch.testing.assert_close(
+            metadata.cu_seqlens_k,
+            torch.tensor([0, length], dtype=torch.int32, device=device),
+            rtol=0,
+            atol=0,
+        )
+
     @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
     def test_torch_topk_uses_direct_flashattention_metadata(self):
         device = torch.device("cuda", torch.cuda.current_device())
@@ -600,14 +1473,19 @@ class TestQuestFixedCapacityCudaGraph(unittest.TestCase):
             cache_seqlens_int32=torch.empty(2, dtype=torch.int32, device=device),
             cu_seqlens_k=torch.empty(3, dtype=torch.int32, device=device),
         )
-        direct_pages, direct_lengths, metadata_prepared = algo.retrieve_topk(
-            queries,
-            0,
-            req_pool_indices,
-            sparse_mask,
-            forward_batch=forward_batch,
-            attn_metadata=attn_metadata,
-        )
+        algo.use_fused_topk_fa_metadata_kernel = True
+        with patch(
+            "sglang.jit_kernel.quest.topk." "quest_topk_to_flashattention_metadata_out",
+            side_effect=AssertionError("fixed graph reached eager fused kernel"),
+        ):
+            direct_pages, direct_lengths, metadata_prepared = algo.retrieve_topk(
+                queries,
+                0,
+                req_pool_indices,
+                sparse_mask,
+                forward_batch=forward_batch,
+                attn_metadata=attn_metadata,
+            )
         self.assertTrue(metadata_prepared)
 
         algo.use_direct_fa_metadata_kernel = False

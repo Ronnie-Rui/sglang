@@ -119,10 +119,11 @@ def _quest_finalize_to_flashattention_metadata_kernel(
         sorted_indices = tl.sort(selected, descending=False)
         valid = sorted_indices != sentinel
         valid_length = tl.sum(valid.to(tl.int32), axis=0)
-        tl.store(valid_lengths_ptr + batch_idx, valid_length)
 
         use_sparse = tl.load(sparse_mask_ptr + batch_idx * sparse_mask_stride_b)
-        active = use_sparse & (valid_length > 0)
+        active_valid_length = tl.where(use_sparse, valid_length, 0)
+        tl.store(valid_lengths_ptr + batch_idx, active_valid_length)
+        active = active_valid_length > 0
         write_mask = active & (offsets < OUTPUT_WIDTH) & valid
         req_idx = tl.load(
             req_pool_indices_ptr + batch_idx * req_pool_indices_stride_b,

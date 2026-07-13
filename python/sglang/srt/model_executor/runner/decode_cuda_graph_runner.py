@@ -400,6 +400,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return None
         return coordinator.select_cuda_graph_page_capacity(forward_batch.seq_lens_cpu)
 
+    def _publish_sparse_graph_page_capacity(self, forward_batch: ForwardBatch):
+        coordinator = self._runtime_sparse_coordinator()
+        if coordinator is not None:
+            coordinator.prepare_graph_forward()
+        capacity = self._select_sparse_graph_page_capacity(forward_batch)
+        # model_runner.forward_end receives the scheduler ForwardBatch, not the
+        # static capture batch. Publish the selected graph variant so post-
+        # replay sparse finalization uses the matching per-capacity state.
+        forward_batch.runtime_sparse_page_capacity = capacity
+        return capacity
+
     def _make_graph_key(
         self,
         bs,
@@ -972,7 +983,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-            sparse_page_capacity = self._select_sparse_graph_page_capacity(
+            sparse_page_capacity = self._publish_sparse_graph_page_capacity(
                 forward_batch
             )
             self._replay_graph_key = self._make_graph_key(
@@ -1054,7 +1065,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        sparse_page_capacity = self._select_sparse_graph_page_capacity(forward_batch)
+        sparse_page_capacity = self._publish_sparse_graph_page_capacity(forward_batch)
         self._replay_graph_key = self._make_graph_key(
             self.bs,
             stream_idx,

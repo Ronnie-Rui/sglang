@@ -155,11 +155,15 @@ class FlashAttentionAdaptor(BackendAdaptor):
 
         max_selected = selected_indices.shape[1]
         metadata_prepared = bool(kwargs.get("metadata_prepared", False))
+        update_metadata_lengths = bool(
+            kwargs.get("update_metadata_lengths", not self._metadata_prepared)
+        )
         if metadata_prepared:
-            if not self._metadata_prepared:
+            if not self._metadata_prepared or update_metadata_lengths:
                 self._max_selected = max_selected
                 self._valid_lengths = valid_lengths
                 current_metadata.max_seq_len_k = max(
+                    current_metadata.max_seq_len_k,
                     self._original_metadata["max_seq_len_k"],
                     max_selected * page_size,
                 )
@@ -189,7 +193,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
             and current_metadata.cu_seqlens_k.is_cuda
         )
         if use_triton_metadata_kernel:
-            update_lengths = not self._metadata_prepared
+            update_lengths = not self._metadata_prepared or update_metadata_lengths
             if update_lengths:
                 self._max_selected = max_selected
                 # Keep the first layer's immutable result by reference. Cloning it
@@ -225,6 +229,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
             )
             if update_lengths:
                 current_metadata.max_seq_len_k = max(
+                    current_metadata.max_seq_len_k,
                     self._original_metadata["max_seq_len_k"],
                     max_selected * page_size,
                 )
@@ -241,7 +246,8 @@ class FlashAttentionAdaptor(BackendAdaptor):
             )
 
         max_selected = physical_pages.shape[1]
-        if not self._metadata_prepared:
+        update_lengths = not self._metadata_prepared or update_metadata_lengths
+        if update_lengths:
             active_sparse_mask = sparse_mask & (valid_lengths > 0)
             valid_mask = torch.arange(
                 max_selected, device=physical_pages.device
@@ -278,6 +284,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
             # runtime sparse attention, so this value is not on the decode hot
             # path today.
             current_metadata.max_seq_len_k = max(
+                current_metadata.max_seq_len_k,
                 self._original_metadata["max_seq_len_k"],
                 max_selected * page_size,
             )

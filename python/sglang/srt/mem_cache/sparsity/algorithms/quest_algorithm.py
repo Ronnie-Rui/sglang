@@ -41,9 +41,206 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.use_direct_fa_metadata_kernel = config.sparse_extra_config.get(
             "use_direct_fa_metadata_kernel", True
         )
+        self.use_fused_topk_fa_metadata_kernel = config.sparse_extra_config.get(
+            "use_fused_topk_fa_metadata_kernel", False
+        )
+        self.use_lazy_page_update_score_kernel = config.sparse_extra_config.get(
+            "use_lazy_page_update_score_kernel", False
+        )
+        self.layer_selection_reuse_interval = config.sparse_extra_config.get(
+            "layer_selection_reuse_interval", 1
+        )
+        self.layer_page_budget = tuple(
+            (
+                budget_range["start_layer"],
+                budget_range["end_layer"],
+                float(budget_range["scale"]),
+            )
+            for budget_range in config.sparse_extra_config.get("layer_page_budget", ())
+        )
+        self._selection_cache = None
+        self._selection_cache_group = None
+        self._selection_cache_layer = None
+        self._actual_selection_anchors = set()
+        self._metadata_length_updates = {}
+        self._last_metadata_layer = None
+        self._lazy_page_update_active = False
+        self._lazy_page_update_graph_states = {}
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
+
+    def begin_forward(self, *args, **kwargs) -> None:
+        # Selection reuse is only valid among consecutive layers of one decode
+        # forward. The first local layer calls this before every eager run or
+        # graph capture; graph replay executes the captured anchor kernels.
+        self._selection_cache = None
+        self._selection_cache_group = None
+        self._selection_cache_layer = None
+        self._actual_selection_anchors.clear()
+        self._metadata_length_updates.clear()
+        self._last_metadata_layer = None
+        super().begin_forward(*args, **kwargs)
+        self._lazy_page_update_active = self._can_enable_lazy_page_update()
+        fixed_capacity = kwargs.get(
+            "fixed_capacity", args[4] if len(args) > 4 else False
+        )
+        if isinstance(fixed_capacity, int) and not isinstance(fixed_capacity, bool):
+            self._lazy_page_update_graph_states[int(fixed_capacity)] = (
+                self._lazy_page_update_active,
+                self._retrieval_plan.max_num_pages,
+            )
+
+    def _get_lazy_page_update_state(self, forward_batch=None) -> tuple[bool, int]:
+        capacity = getattr(forward_batch, "runtime_sparse_page_capacity", None)
+        if isinstance(capacity, int) and not isinstance(capacity, bool):
+            graph_state = self._lazy_page_update_graph_states.get(capacity)
+            if graph_state is not None:
+                return graph_state
+
+        plan = self._retrieval_plan
+        return (
+            self._lazy_page_update_active,
+            plan.max_num_pages if plan is not None else 0,
+        )
+
+    def should_finalize_graph_forward(self, forward_batch) -> bool:
+        capacity = getattr(forward_batch, "runtime_sparse_page_capacity", None)
+        if isinstance(capacity, int) and not isinstance(capacity, bool):
+            return capacity in self._lazy_page_update_graph_states
+        return False
+
+    def _get_layer_budget_scale(self, layer_id: int) -> float:
+        for start_layer, end_layer, scale in self.layer_page_budget:
+            if start_layer <= layer_id < end_layer:
+                return scale
+        return 1.0
+
+    def get_layer_sparsity_ratio(self, layer_id: int) -> float:
+        return self.sparsity_ratio * self._get_layer_budget_scale(layer_id)
+
+    def _selection_group(self, layer_id: int) -> tuple[int, float]:
+        local_layer_id = layer_id - self.start_layer
+        return (
+            local_layer_id // self.layer_selection_reuse_interval,
+            self._get_layer_budget_scale(layer_id),
+        )
+
+    def _is_selection_anchor(self, layer_id: int) -> bool:
+        return layer_id == self.start_layer or self._selection_group(
+            layer_id
+        ) != self._selection_group(layer_id - 1)
+
+    def _is_actual_selection_anchor(self, layer_id: int) -> bool:
+        # Direct representation-update callers do not pass through retrieval.
+        # Preserve their static-anchor behavior while making live forwards use
+        # the layers that really recomputed selection.
+        return (
+            layer_id in self._actual_selection_anchors
+            if self._actual_selection_anchors
+            else self._is_selection_anchor(layer_id)
+        )
+
+    def _can_enable_lazy_page_update(self) -> bool:
+        plan = self._retrieval_plan
+        if (
+            not self.use_lazy_page_update_score_kernel
+            or not self.use_triton_score_kernel
+            or plan is None
+            or plan.max_num_pages <= self.num_recent_pages
+            or torch.device(self.device).type != "cuda"
+            or torch.version.hip is not None
+            or self.req_to_token_pool is None
+            or self.token_to_kv_pool is None
+            or self.states is None
+            or self.page_size <= 0
+            or self.page_size > 32
+        ):
+            return False
+
+        key_buffer = self.token_to_kv_pool.get_key_buffer(self.start_layer)
+        if (
+            key_buffer.ndim != 3
+            or key_buffer.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or key_buffer.shape[0] <= 0
+            or key_buffer.shape[1] <= 0
+            or key_buffer.shape[2] <= 0
+            or key_buffer.shape[2] > 256
+        ):
+            return False
+
+        tensors = (
+            self.req_to_token_pool.req_to_token,
+            self.states.repr_constructed,
+            self.states.last_constructed_page,
+            self.page_k_min[self.start_layer],
+            self.page_k_max[self.start_layer],
+            self.page_valid[self.start_layer],
+        )
+        return all(tensor.device == key_buffer.device for tensor in tensors)
+
+    def should_update_metadata_lengths(self, layer_id: int) -> bool:
+        cached = self._metadata_length_updates.get(layer_id)
+        if cached is not None:
+            return cached
+
+        previous_layer = self._last_metadata_layer
+        update_lengths = previous_layer is None or self._get_layer_budget_scale(
+            layer_id
+        ) != self._get_layer_budget_scale(previous_layer)
+        self._metadata_length_updates[layer_id] = update_lengths
+        self._last_metadata_layer = layer_id
+        return update_lengths
+
+    def should_update_representations(self, forward_batch) -> bool:
+        # Lazy retrieval updates each actual selection anchor while scoring.
+        # Keep graph forward_end active so it reaches the shared finalizer.
+        if self._get_lazy_page_update_state(forward_batch)[0]:
+            return True
+        return super().should_update_representations(forward_batch)
+
+    def retrieve_topk(
+        self,
+        queries: torch.Tensor,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        **kwargs,
+    ) -> tuple:
+        # The coordinator asks before retrieval while fused metadata paths ask
+        # again inside retrieval. Cache one decision for both call sites.
+        self.should_update_metadata_lengths(layer_id)
+        group = self._selection_group(layer_id)
+        previous_layer = self._selection_cache_layer
+        layer_order_is_contiguous = (
+            previous_layer is None or layer_id == previous_layer + 1
+        )
+        can_reuse = (
+            self._selection_cache is not None
+            and self._selection_cache_group == group
+            and self._selection_cache_layer is not None
+            and layer_order_is_contiguous
+            and layer_id != self.start_layer
+        )
+        if can_reuse:
+            self._selection_cache_layer = layer_id
+            selected_indices, valid_lengths = self._selection_cache
+            # The anchor layer already rewrote the shared FA metadata. Marking
+            # it prepared avoids remapping or rewriting the same pages.
+            return selected_indices, valid_lengths, True
+
+        self._actual_selection_anchors.add(layer_id)
+        result = super().retrieve_topk(
+            queries,
+            layer_id,
+            req_pool_indices,
+            sparse_mask,
+            **kwargs,
+        )
+        self._selection_cache = result[:2]
+        self._selection_cache_group = group
+        self._selection_cache_layer = layer_id
+        return result
 
     def _can_use_triton_page_update(
         self,
@@ -83,11 +280,17 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
     ) -> None:
         if not forward_batch.forward_mode.is_decode():
             return
+        lazy_page_update_active, _ = self._get_lazy_page_update_state(forward_batch)
+        if lazy_page_update_active:
+            return
         if not self.should_update_representations(forward_batch):
             return
 
+        if not self._is_actual_selection_anchor(layer_id):
+            return
+
         if not self._can_use_triton_page_update(req_pool_indices, seq_lens, k_buffer):
-            return super().update_representations(
+            return self._update_representations_without_tracker_advance(
                 layer_id,
                 req_pool_indices,
                 seq_lens,
@@ -95,6 +298,9 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 forward_batch,
             )
 
+        # Reused layers never consume their own decode-time Quest bounds. Every
+        # actual anchor writes against the same pre-forward tracker snapshot;
+        # finalize_forward advances it only after all anchors have completed.
         from sglang.srt.mem_cache.sparsity.kernels.quest_page_update import (
             quest_update_page_representations_,
         )
@@ -110,7 +316,92 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             self.page_k_max[layer_id],
             self.page_valid[layer_id],
             self.page_size,
-            advance_trackers=layer_id == self.end_layer - 1,
+            advance_trackers=False,
+        )
+
+    def _update_representations_without_tracker_advance(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_buffer: torch.Tensor,
+        forward_batch,
+    ) -> None:
+        """Portable representation update that leaves shared trackers unchanged."""
+        end_page = seq_lens // self.page_size
+        constructed = self.states.repr_constructed[req_pool_indices]
+        start_page = torch.where(
+            constructed,
+            self.states.last_constructed_page[req_pool_indices],
+            torch.zeros_like(end_page),
+        )
+        valid_mask = start_page < end_page
+        if not valid_mask.any():
+            return
+
+        self._compute_page_representations(
+            layer_id,
+            req_pool_indices[valid_mask],
+            seq_lens[valid_mask],
+            start_page[valid_mask],
+            end_page[valid_mask],
+            k_buffer,
+        )
+
+    def finalize_forward(self, forward_batch) -> None:
+        if not forward_batch.forward_mode.is_decode():
+            return
+
+        req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if req_pool_indices is None or seq_lens is None:
+            return
+
+        lazy_page_update_active, lazy_max_pages = self._get_lazy_page_update_state(
+            forward_batch
+        )
+        if lazy_page_update_active:
+            if lazy_max_pages <= 0:
+                return
+            from sglang.srt.mem_cache.sparsity.kernels.quest_score import (
+                quest_advance_lazy_page_trackers_,
+            )
+
+            quest_advance_lazy_page_trackers_(
+                req_pool_indices,
+                seq_lens,
+                self.states.repr_constructed,
+                self.states.last_constructed_page,
+                self.page_size,
+                max_pages=lazy_max_pages,
+            )
+            return
+
+        if not self.should_update_representations(forward_batch):
+            return
+
+        if req_pool_indices.is_cuda and torch.version.hip is None:
+            from sglang.srt.mem_cache.sparsity.kernels.quest_page_update import (
+                quest_advance_page_trackers_,
+            )
+
+            quest_advance_page_trackers_(
+                req_pool_indices,
+                seq_lens,
+                self.states.repr_constructed,
+                self.states.last_constructed_page,
+                self.page_size,
+            )
+            return
+
+        end_page = seq_lens // self.page_size
+        constructed = self.states.repr_constructed[req_pool_indices]
+        last_page = self.states.last_constructed_page[req_pool_indices]
+        start_page = torch.where(constructed, last_page, torch.zeros_like(end_page))
+        update_mask = start_page < end_page
+        self.states.repr_constructed[req_pool_indices] = constructed | update_mask
+        self.states.last_constructed_page[req_pool_indices] = torch.where(
+            update_mask, end_page, last_page
         )
 
     def _initialize_representation_pools(
@@ -219,6 +510,31 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         )
 
     def _retrieve_page_scores_batched(self, layer_id, queries, plan) -> torch.Tensor:
+        if getattr(
+            self, "_lazy_page_update_active", False
+        ) and self._can_use_triton_score_kernel(queries):
+            from sglang.srt.mem_cache.sparsity.kernels.quest_score import (
+                quest_lazy_update_page_scores,
+            )
+
+            return quest_lazy_update_page_scores(
+                queries=queries,
+                page_k_min=self.page_k_min[layer_id],
+                page_k_max=self.page_k_max[layer_id],
+                page_valid=self.page_valid[layer_id],
+                physical_pages=plan.physical_pages,
+                req_pool_indices=plan.req_pool_indices,
+                seq_lens=plan.seq_lens,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
+                repr_constructed=self.states.repr_constructed,
+                last_constructed_page=self.states.last_constructed_page,
+                page_size=self.page_size,
+                active_mask=plan.active_mask,
+                history_page_counts=plan.recent_start,
+                advance_trackers=False,
+            )
+
         if self.use_fused_score_mask_kernel and self._can_use_triton_score_kernel(
             queries
         ):
@@ -245,6 +561,33 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         queries: torch.Tensor,
     ) -> torch.Tensor:
         physical_pages = phys_pages
+
+        if getattr(
+            self, "_lazy_page_update_active", False
+        ) and self._can_use_triton_score_kernel(queries):
+            plan = self._retrieval_plan
+            if plan is None:
+                raise RuntimeError("Quest lazy page update requires a retrieval plan")
+
+            from sglang.srt.mem_cache.sparsity.kernels.quest_score import (
+                quest_lazy_update_page_scores,
+            )
+
+            return quest_lazy_update_page_scores(
+                queries=queries,
+                page_k_min=self.page_k_min[layer_id],
+                page_k_max=self.page_k_max[layer_id],
+                page_valid=self.page_valid[layer_id],
+                physical_pages=physical_pages,
+                req_pool_indices=req_pool_indices,
+                seq_lens=plan.seq_lens,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
+                repr_constructed=self.states.repr_constructed,
+                last_constructed_page=self.states.last_constructed_page,
+                page_size=self.page_size,
+                advance_trackers=False,
+            )
 
         if self._can_use_triton_score_kernel(queries):
             from sglang.srt.mem_cache.sparsity.kernels.quest_score import (

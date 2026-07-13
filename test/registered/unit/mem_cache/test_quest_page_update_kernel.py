@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
 from sglang.srt.mem_cache.sparsity.kernels.quest_page_update import (
+    quest_advance_page_trackers_,
     quest_update_page_representations_,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -20,9 +21,10 @@ class _DecodeMode:
 
 
 class TestQuestPageUpdateDispatch(unittest.TestCase):
-    def test_algorithm_advances_trackers_only_on_last_layer(self):
+    def test_algorithm_defers_tracker_advance_to_forward_finalize(self):
         config = SimpleNamespace(page_size=4, sparse_extra_config={})
         algorithm = QuestAlgorithm(config, torch.device("cpu"))
+        algorithm.start_layer = 0
         algorithm.end_layer = 2
         algorithm.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.zeros((1, 4), dtype=torch.int32)
@@ -40,11 +42,15 @@ class TestQuestPageUpdateDispatch(unittest.TestCase):
         algorithm.page_valid = {
             layer_id: torch.zeros(1, dtype=torch.bool) for layer_id in range(2)
         }
-        forward_batch = SimpleNamespace(forward_mode=_DecodeMode())
-        algorithm._representation_update_batch = forward_batch
-        algorithm._representation_update_due = True
         req_pool_indices = torch.zeros(1, dtype=torch.int64)
         seq_lens = torch.full((1,), 4, dtype=torch.int64)
+        forward_batch = SimpleNamespace(
+            forward_mode=_DecodeMode(),
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+        )
+        algorithm._representation_update_batch = forward_batch
+        algorithm._representation_update_due = True
         k_buffer = torch.zeros((4, 1, 1))
 
         with (
@@ -63,7 +69,12 @@ class TestQuestPageUpdateDispatch(unittest.TestCase):
 
         self.assertEqual(update_kernel.call_count, 2)
         self.assertFalse(update_kernel.call_args_list[0].kwargs["advance_trackers"])
-        self.assertTrue(update_kernel.call_args_list[1].kwargs["advance_trackers"])
+        self.assertFalse(update_kernel.call_args_list[1].kwargs["advance_trackers"])
+        self.assertEqual(algorithm.states.last_constructed_page.item(), 0)
+
+        algorithm.finalize_forward(forward_batch)
+
+        self.assertEqual(algorithm.states.last_constructed_page.item(), 1)
 
 
 def _reference_update(
@@ -183,6 +194,33 @@ class TestQuestPageUpdateKernel(unittest.TestCase):
 
     def test_trackers_advance_only_when_requested(self):
         self._assert_matches_reference(advance_trackers=True)
+
+    def test_tracker_only_update_uses_complete_page_boundary(self):
+        inputs = self._make_inputs()
+
+        quest_advance_page_trackers_(
+            inputs["req_pool_indices"],
+            inputs["seq_lens"],
+            inputs["repr_constructed"],
+            inputs["last_constructed_page"],
+            self.page_size,
+        )
+        torch.cuda.synchronize()
+
+        self.assertTrue(
+            torch.equal(
+                inputs["repr_constructed"],
+                torch.tensor([True, False, True, True], device="cuda"),
+            )
+        )
+        # Slot 0 starts unconstructed, slot 2 must not move backwards, and
+        # slot 3 advances exactly through seq_len // page_size complete pages.
+        self.assertTrue(
+            torch.equal(
+                inputs["last_constructed_page"],
+                torch.tensor([2, 0, 1, 3], device="cuda"),
+            )
+        )
 
     def test_cuda_graph_replay_reads_new_boundaries(self):
         inputs = self._make_inputs()

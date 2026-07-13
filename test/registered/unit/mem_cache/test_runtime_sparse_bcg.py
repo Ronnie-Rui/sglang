@@ -8,7 +8,6 @@ from sglang.srt.layers import radix_attention
 from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import SparseCoordinator
 from sglang.test.ci.ci_register import register_cpu_ci
 
-
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
@@ -217,6 +216,96 @@ class TestBreakableSparseAttention(unittest.TestCase):
                 )
 
 
+class TestSparseCoordinatorForwardLifecycle(unittest.TestCase):
+    @staticmethod
+    def _make_coordinator():
+        coordinator = object.__new__(SparseCoordinator)
+        coordinator.start_layer = 12
+        coordinator.end_layer = 16
+        coordinator._last_sparse_layer_id = None
+        coordinator._forward_started = False
+        coordinator.algorithm = SimpleNamespace(
+            begin_forward=Mock(), finalize_forward=Mock()
+        )
+        coordinator.backend_adaptor = SimpleNamespace(save_original_metadata=Mock())
+        coordinator._compute_sparse_mask = Mock(
+            return_value=torch.tensor([True], dtype=torch.bool)
+        )
+        coordinator._handle_sparse_retrieve = Mock(return_value="adapted")
+        return coordinator
+
+    def test_first_actual_pp_layer_initializes_and_same_batch_wrap_reinitializes(self):
+        coordinator = self._make_coordinator()
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([3]),
+            seq_lens=torch.tensor([64]),
+        )
+        metadata = object()
+
+        # Configured layer 12 may have key=None and never reach the coordinator.
+        # The first actual local layer still owns forward initialization.
+        for layer_id in (13, 14):
+            result = coordinator.attention_begin(
+                torch.empty((1, 1, 1)),
+                torch.empty((1, 1, 1)),
+                torch.empty((1, 1, 1)),
+                SimpleNamespace(layer_id=layer_id),
+                forward_batch,
+                metadata,
+                fixed_capacity=640,
+            )
+            self.assertEqual(result, "adapted")
+
+        # Reusing and mutating the same ForwardBatch must not preserve the old
+        # retrieval plan. Layer order wraps from 14 back to 13.
+        forward_batch.seq_lens = torch.tensor([32000])
+        coordinator.attention_begin(
+            torch.empty((1, 1, 1)),
+            torch.empty((1, 1, 1)),
+            torch.empty((1, 1, 1)),
+            SimpleNamespace(layer_id=13),
+            forward_batch,
+            metadata,
+            fixed_capacity=2112,
+        )
+
+        self.assertEqual(coordinator.algorithm.begin_forward.call_count, 2)
+        self.assertEqual(
+            [
+                call.kwargs["fixed_capacity"]
+                for call in coordinator.algorithm.begin_forward.call_args_list
+            ],
+            [640, 2112],
+        )
+        self.assertEqual(
+            coordinator.backend_adaptor.save_original_metadata.call_count, 2
+        )
+        self.assertEqual(coordinator._compute_sparse_mask.call_count, 2)
+
+    def test_all_skipped_eager_forward_does_not_finalize_stale_algorithm_state(self):
+        coordinator = self._make_coordinator()
+        forward_batch = SimpleNamespace()
+
+        coordinator.finalize_forward(forward_batch)
+
+        coordinator.algorithm.finalize_forward.assert_not_called()
+        self.assertFalse(coordinator._forward_started)
+        self.assertIsNone(coordinator._last_sparse_layer_id)
+
+    def test_eager_begin_clears_capacity_published_by_previous_graph_replay(self):
+        coordinator = self._make_coordinator()
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([3]),
+            seq_lens=torch.tensor([64]),
+            runtime_sparse_page_capacity=640,
+        )
+
+        coordinator.forward_begin(forward_batch, fixed_capacity=False)
+
+        self.assertIsNone(forward_batch.runtime_sparse_page_capacity)
+        coordinator.algorithm.begin_forward.assert_called_once()
+
+
 class TestSparseCoordinatorForwardEnd(unittest.TestCase):
     def test_selects_smallest_graph_page_bucket_from_host_lengths(self):
         coordinator = object.__new__(SparseCoordinator)
@@ -242,8 +331,10 @@ class TestSparseCoordinatorForwardEnd(unittest.TestCase):
         coordinator.start_layer = 2
         coordinator.end_layer = 5
         coordinator.algorithm = SimpleNamespace(
+            should_finalize_graph_forward=Mock(return_value=True),
             should_update_representations=Mock(return_value=True),
             update_representations=Mock(),
+            finalize_forward=Mock(),
         )
         coordinator.token_to_kv_pool = SimpleNamespace(
             get_key_buffer=Mock(side_effect=lambda layer_id: f"key-{layer_id}")
@@ -266,14 +357,17 @@ class TestSparseCoordinatorForwardEnd(unittest.TestCase):
         )
         for call in coordinator.algorithm.update_representations.call_args_list:
             self.assertIs(call.kwargs["forward_batch"], forward_batch)
+        coordinator.algorithm.finalize_forward.assert_called_once_with(forward_batch)
 
     def test_skips_all_layer_buffers_away_from_page_boundary(self):
         coordinator = object.__new__(SparseCoordinator)
         coordinator.start_layer = 2
         coordinator.end_layer = 5
         coordinator.algorithm = SimpleNamespace(
+            should_finalize_graph_forward=Mock(return_value=True),
             should_update_representations=Mock(return_value=False),
             update_representations=Mock(),
+            finalize_forward=Mock(),
         )
         coordinator.token_to_kv_pool = SimpleNamespace(get_key_buffer=Mock())
         forward_batch = SimpleNamespace(
@@ -289,6 +383,64 @@ class TestSparseCoordinatorForwardEnd(unittest.TestCase):
         )
         coordinator.token_to_kv_pool.get_key_buffer.assert_not_called()
         coordinator.algorithm.update_representations.assert_not_called()
+        coordinator.algorithm.finalize_forward.assert_called_once_with(forward_batch)
+
+    def test_skips_graph_tail_when_sparse_path_was_not_captured(self):
+        coordinator = object.__new__(SparseCoordinator)
+        coordinator.start_layer = 2
+        coordinator.end_layer = 5
+        coordinator.algorithm = SimpleNamespace(
+            should_finalize_graph_forward=Mock(return_value=False),
+            should_update_representations=Mock(),
+            update_representations=Mock(),
+            finalize_forward=Mock(),
+        )
+        coordinator.token_to_kv_pool = SimpleNamespace(get_key_buffer=Mock())
+        forward_batch = SimpleNamespace(forward_mode=_ForwardMode(decode=True))
+
+        coordinator.forward_end(forward_batch)
+
+        coordinator.algorithm.should_finalize_graph_forward.assert_called_once_with(
+            forward_batch
+        )
+        coordinator.algorithm.should_update_representations.assert_not_called()
+        coordinator.algorithm.update_representations.assert_not_called()
+        coordinator.algorithm.finalize_forward.assert_not_called()
+
+    def test_bcg_tail_runs_after_eager_break_started_the_forward(self):
+        coordinator = object.__new__(SparseCoordinator)
+        coordinator.start_layer = 2
+        coordinator.end_layer = 3
+        coordinator._forward_started = True
+        coordinator._last_sparse_layer_id = 2
+        coordinator.algorithm = SimpleNamespace(
+            should_finalize_graph_forward=Mock(return_value=False),
+            should_update_representations=Mock(return_value=False),
+            update_representations=Mock(),
+            finalize_forward=Mock(),
+        )
+        coordinator.token_to_kv_pool = SimpleNamespace(get_key_buffer=Mock())
+        forward_batch = SimpleNamespace(
+            forward_mode=_ForwardMode(decode=True),
+            req_pool_indices=torch.tensor([3]),
+            seq_lens=torch.tensor([31]),
+        )
+
+        coordinator.forward_end(forward_batch)
+
+        coordinator.algorithm.finalize_forward.assert_called_once_with(forward_batch)
+        self.assertFalse(coordinator._forward_started)
+        self.assertIsNone(coordinator._last_sparse_layer_id)
+
+    def test_prepare_graph_forward_discards_capture_time_lifecycle_state(self):
+        coordinator = object.__new__(SparseCoordinator)
+        coordinator._forward_started = True
+        coordinator._last_sparse_layer_id = 27
+
+        coordinator.prepare_graph_forward()
+
+        self.assertFalse(coordinator._forward_started)
+        self.assertIsNone(coordinator._last_sparse_layer_id)
 
 
 if __name__ == "__main__":
