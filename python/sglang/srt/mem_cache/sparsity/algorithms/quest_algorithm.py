@@ -135,7 +135,6 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self._lazy_page_update_graph_states = {}
         self._last_superpage_certified = None
         self._last_superpage_candidate_group_count = 0
-        self._superpage_certified_by_plan = {}
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
@@ -1046,7 +1045,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 self.page_k_max[layer_id],
                 self.page_valid[layer_id],
                 self.page_size,
-                advance_trackers=False,
+                advance_trackers=self._use_layer_representation_trackers,
             )
 
         from sglang.srt.mem_cache.sparsity.kernels.quest_score import (
@@ -1070,13 +1069,6 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self._last_superpage_candidate_group_count = (
             self._superpage_candidate_group_count(plan)
         )
-        plan_key = (
-            bool(plan.fixed_capacity),
-            plan.batch_size,
-            plan.max_num_pages,
-            plan.max_k,
-        )
-        self._superpage_certified_by_plan[plan_key] = certified
         return scores
 
     def _retrieve_page_scores_batched(self, layer_id, queries, plan) -> torch.Tensor:

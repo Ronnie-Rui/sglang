@@ -2026,7 +2026,7 @@ class TestQuestFixedCapacityCudaGraph(unittest.TestCase):
         device = torch.device("cuda", torch.cuda.current_device())
         for use_fixed_capacity in (False, True):
             with self.subTest(use_fixed_capacity=use_fixed_capacity):
-                long_seq_lens = torch.tensor([6, 4], dtype=torch.int64, device=device)
+                long_seq_lens = torch.tensor([6, 6], dtype=torch.int64, device=device)
                 algo, k_buffer = _make_algorithm(
                     batch_size=2,
                     seq_lens=long_seq_lens,
@@ -2095,7 +2095,7 @@ class TestQuestFixedCapacityCudaGraph(unittest.TestCase):
                 _, layer2_last_page = algo.get_layer_representation_trackers(2)
                 torch.testing.assert_close(
                     layer0_last_page,
-                    torch.tensor([5, 3], dtype=torch.int64, device=device),
+                    torch.tensor([5, 5], dtype=torch.int64, device=device),
                 )
                 torch.testing.assert_close(layer2_last_page, initial_pages)
 
