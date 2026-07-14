@@ -522,6 +522,79 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
                 ):
                     parse_runtime_sparse_config(server_args)
 
+    def test_quest_runtime_accepts_context_adaptive_layer_selection_reuse(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            attention_backend="fa3",
+            page_size=16,
+            hisparse_config=(
+                '{"algorithm":"quest","backend":"fa3","page_size":16,'
+                '"layer_selection_reuse_interval":2,'
+                '"context_adaptive_layer_selection_reuse_interval":4,'
+                '"context_adaptive_layer_selection_reuse_min_pages":1024,'
+                '"use_lazy_page_update_score_kernel":true}'
+            ),
+        )
+
+        config = parse_runtime_sparse_config(server_args)
+
+        self.assertEqual(
+            config.sparse_extra_config[
+                "context_adaptive_layer_selection_reuse_interval"
+            ],
+            4,
+        )
+        self.assertEqual(
+            config.sparse_extra_config[
+                "context_adaptive_layer_selection_reuse_min_pages"
+            ],
+            1024,
+        )
+
+    def test_quest_runtime_rejects_invalid_context_adaptive_layer_reuse(self):
+        invalid_configs = (
+            {"context_adaptive_layer_selection_reuse_interval": 4},
+            {"context_adaptive_layer_selection_reuse_min_pages": 1024},
+            {
+                "context_adaptive_layer_selection_reuse_interval": 2,
+                "context_adaptive_layer_selection_reuse_min_pages": 1024,
+                "layer_selection_reuse_interval": 2,
+            },
+            {
+                "context_adaptive_layer_selection_reuse_interval": True,
+                "context_adaptive_layer_selection_reuse_min_pages": 1024,
+            },
+            {
+                "context_adaptive_layer_selection_reuse_interval": 4,
+                "context_adaptive_layer_selection_reuse_min_pages": 0,
+            },
+            {
+                "context_adaptive_layer_selection_reuse_interval": 4,
+                "context_adaptive_layer_selection_reuse_min_pages": 1024,
+            },
+        )
+        for invalid_config in invalid_configs:
+            with self.subTest(invalid_config=invalid_config):
+                hisparse_config = {
+                    "algorithm": "quest",
+                    "backend": "fa3",
+                    "page_size": 16,
+                    **invalid_config,
+                }
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=json.dumps(hisparse_config),
+                )
+
+                with self.assertRaisesRegex(ValueError, "context.adaptive"):
+                    parse_runtime_sparse_config(server_args)
+
     def test_quest_runtime_defaults_decode_token_selection_reuse_interval(self):
         from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import (
             QuestAlgorithm,

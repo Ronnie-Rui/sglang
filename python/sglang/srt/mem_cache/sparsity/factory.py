@@ -5,6 +5,8 @@ from typing import Optional
 import torch
 
 from sglang.srt.arg_groups.hisparse_hook import (
+    QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_INTERVAL_OPTION,
+    QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_MIN_PAGES_OPTION,
     QUEST_DECODE_TOKEN_SELECTION_REUSE_INTERVAL_OPTION,
     QUEST_MAX_SELECTED_TOKENS_OPTION,
     QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION,
@@ -240,6 +242,64 @@ def parse_runtime_sparse_config(server_args) -> SparseConfig:
             "positive integer, "
             f"got {layer_selection_reuse_interval!r}."
         )
+
+    context_adaptive_interval_present = (
+        QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_INTERVAL_OPTION
+        in config.sparse_extra_config
+    )
+    context_adaptive_min_pages_present = (
+        QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_MIN_PAGES_OPTION
+        in config.sparse_extra_config
+    )
+    if context_adaptive_interval_present != context_adaptive_min_pages_present:
+        raise ValueError(
+            "Sparse runtime config context-adaptive layer selection reuse "
+            "requires both context_adaptive_layer_selection_reuse_interval and "
+            "context_adaptive_layer_selection_reuse_min_pages."
+        )
+    if context_adaptive_interval_present:
+        context_adaptive_interval = config.sparse_extra_config[
+            QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_INTERVAL_OPTION
+        ]
+        context_adaptive_min_pages = config.sparse_extra_config[
+            QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_MIN_PAGES_OPTION
+        ]
+        for option, value in (
+            (
+                QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_INTERVAL_OPTION,
+                context_adaptive_interval,
+            ),
+            (
+                QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_MIN_PAGES_OPTION,
+                context_adaptive_min_pages,
+            ),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(
+                    f"Sparse runtime config {option} must be a positive integer, "
+                    f"got {value!r}."
+                )
+
+        base_interval = layer_selection_reuse_interval or 1
+        if context_adaptive_interval <= base_interval:
+            raise ValueError(
+                "Sparse runtime config "
+                "context_adaptive_layer_selection_reuse_interval must be greater "
+                f"than layer_selection_reuse_interval ({base_interval}), got "
+                f"{context_adaptive_interval}."
+            )
+        if (
+            config.sparse_extra_config.get("use_lazy_page_update_score_kernel")
+            is not True
+            or config.sparse_extra_config.get("use_triton_score_kernel", True)
+            is not True
+        ):
+            raise ValueError(
+                "Sparse runtime config context-adaptive layer selection reuse "
+                "requires use_lazy_page_update_score_kernel=true and "
+                "use_triton_score_kernel=true so restored anchors can materialize "
+                "missed page bounds before scoring."
+            )
 
     if QUEST_DECODE_TOKEN_SELECTION_REUSE_INTERVAL_OPTION in config.sparse_extra_config:
         decode_token_selection_reuse_interval = config.sparse_extra_config[

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 import torch
 
 from sglang.srt.arg_groups.hisparse_hook import (
+    QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_INTERVAL_OPTION,
+    QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_MIN_PAGES_OPTION,
     QUEST_DECODE_TOKEN_SELECTION_REUSE_INTERVAL_OPTION,
     QUEST_MAX_SELECTED_TOKENS_OPTION,
     QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION,
@@ -30,7 +32,7 @@ class _DecodeSelectionCacheState:
     request_signature: tuple
     sequence_lengths: tuple[int, ...]
     page_counts: tuple[int, ...]
-    selections: dict[tuple[int, float], tuple[torch.Tensor, torch.Tensor]]
+    selections: dict[tuple[int, float, int], tuple[torch.Tensor, torch.Tensor]]
     age: int
 
 
@@ -77,6 +79,28 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.layer_selection_reuse_interval = config.sparse_extra_config.get(
             "layer_selection_reuse_interval", 1
         )
+        self.context_adaptive_layer_selection_reuse_interval = (
+            config.sparse_extra_config.get(
+                QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_INTERVAL_OPTION
+            )
+        )
+        self.context_adaptive_layer_selection_reuse_min_pages = (
+            config.sparse_extra_config.get(
+                QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_MIN_PAGES_OPTION
+            )
+        )
+        self._active_layer_selection_reuse_interval = (
+            self.layer_selection_reuse_interval
+        )
+        self._context_adaptive_layer_selection_reuse_active = False
+        self._active_selection_graph_capacity = None
+        self._layer_selection_reuse_graph_intervals = {}
+        self._actual_selection_anchor_graph_states = {}
+        self._use_layer_representation_trackers = (
+            self.context_adaptive_layer_selection_reuse_interval is not None
+        )
+        self._layer_repr_constructed = {}
+        self._layer_last_constructed_page = {}
         self.decode_token_selection_reuse_interval = config.sparse_extra_config.get(
             QUEST_DECODE_TOKEN_SELECTION_REUSE_INTERVAL_OPTION, 1
         )
@@ -115,19 +139,64 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self._actual_selection_anchors.clear()
         self._metadata_length_updates.clear()
         self._last_metadata_layer = None
-        self._discard_pending_decode_selection_cache()
-        super().begin_forward(*args, **kwargs)
-        self._lazy_page_update_active = self._can_enable_lazy_page_update()
-        forward_batch = kwargs.get("forward_batch", args[0] if args else None)
+        self._active_layer_selection_reuse_interval = (
+            self.layer_selection_reuse_interval
+        )
+        self._context_adaptive_layer_selection_reuse_active = False
         fixed_capacity = kwargs.get(
             "fixed_capacity", args[4] if len(args) > 4 else False
         )
+        self._active_selection_graph_capacity = (
+            int(fixed_capacity)
+            if isinstance(fixed_capacity, int) and not isinstance(fixed_capacity, bool)
+            else None
+        )
+        self._discard_pending_decode_selection_cache()
+        super().begin_forward(*args, **kwargs)
+        self._lazy_page_update_active = self._can_enable_lazy_page_update()
+        self._select_active_layer_selection_reuse_interval()
+        if self._active_selection_graph_capacity is not None:
+            capacity = self._active_selection_graph_capacity
+            self._layer_selection_reuse_graph_intervals[capacity] = (
+                self._active_layer_selection_reuse_interval
+            )
+            self._actual_selection_anchor_graph_states[capacity] = set()
+        forward_batch = kwargs.get("forward_batch", args[0] if args else None)
         if isinstance(fixed_capacity, int) and not isinstance(fixed_capacity, bool):
             self._lazy_page_update_graph_states[int(fixed_capacity)] = (
                 self._lazy_page_update_active,
                 self._retrieval_plan.max_num_pages,
             )
         self._prepare_decode_selection_cache(forward_batch, fixed_capacity)
+
+    def _select_active_layer_selection_reuse_interval(self) -> None:
+        """Select a host-known interval without reading a device scalar."""
+        adaptive_interval = self.context_adaptive_layer_selection_reuse_interval
+        min_pages = self.context_adaptive_layer_selection_reuse_min_pages
+        plan = self._retrieval_plan
+        if (
+            adaptive_interval is None
+            or min_pages is None
+            or plan is None
+            or not self._lazy_page_update_active
+        ):
+            return
+
+        if plan.fixed_capacity:
+            signal_pages = plan.max_num_pages
+        elif plan.num_pages_cpu is not None:
+            # A whole forward shares one layer schedule. Require every row to
+            # cross the threshold so one long request cannot make shorter rows
+            # inherit a more approximate interval.
+            signal_pages = min(plan.num_pages_cpu, default=0)
+        else:
+            # Missing host metadata must not turn this optional optimization
+            # into a device-to-host synchronization point.
+            return
+
+        if signal_pages >= min_pages:
+            self._active_layer_selection_reuse_interval = adaptive_interval
+            self._context_adaptive_layer_selection_reuse_active = True
 
     @staticmethod
     def _host_int_tuple(value, expected_size: int) -> tuple[int, ...] | None:
@@ -300,22 +369,43 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             return None
         return self.quest_max_selected_pages - self.num_recent_pages
 
-    def _selection_group(self, layer_id: int) -> tuple[int, float]:
+    def _selection_group(
+        self, layer_id: int, *, interval: int | None = None
+    ) -> tuple[int, float, int]:
+        interval = interval or self._active_layer_selection_reuse_interval
         local_layer_id = layer_id - self.start_layer
         return (
-            local_layer_id // self.layer_selection_reuse_interval,
+            local_layer_id // interval,
             self._get_layer_budget_scale(layer_id),
+            interval,
         )
 
-    def _is_selection_anchor(self, layer_id: int) -> bool:
+    def _is_selection_anchor(
+        self, layer_id: int, *, interval: int | None = None
+    ) -> bool:
         return layer_id == self.start_layer or self._selection_group(
-            layer_id
-        ) != self._selection_group(layer_id - 1)
+            layer_id, interval=interval
+        ) != self._selection_group(layer_id - 1, interval=interval)
 
-    def _is_actual_selection_anchor(self, layer_id: int) -> bool:
+    def _mark_actual_selection_anchor(self, layer_id: int) -> None:
+        self._actual_selection_anchors.add(layer_id)
+        if self._active_selection_graph_capacity is not None:
+            self._actual_selection_anchor_graph_states[
+                self._active_selection_graph_capacity
+            ].add(layer_id)
+
+    def _is_actual_selection_anchor(self, layer_id: int, forward_batch=None) -> bool:
         # Direct representation-update callers do not pass through retrieval.
         # Preserve their static-anchor behavior while making live forwards use
         # the layers that really recomputed selection.
+        capacity = getattr(forward_batch, "runtime_sparse_page_capacity", None)
+        if isinstance(capacity, int) and not isinstance(capacity, bool):
+            graph_anchors = self._actual_selection_anchor_graph_states.get(capacity)
+            if graph_anchors:
+                return layer_id in graph_anchors
+            graph_interval = self._layer_selection_reuse_graph_intervals.get(capacity)
+            if graph_interval is not None:
+                return self._is_selection_anchor(layer_id, interval=graph_interval)
         return (
             layer_id in self._actual_selection_anchors
             if self._actual_selection_anchors
@@ -350,10 +440,13 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         ):
             return False
 
+        repr_constructed, last_constructed_page = (
+            self.get_layer_representation_trackers(self.start_layer)
+        )
         tensors = (
             self.req_to_token_pool.req_to_token,
-            self.states.repr_constructed,
-            self.states.last_constructed_page,
+            repr_constructed,
+            last_constructed_page,
             self.page_k_min[self.start_layer],
             self.page_k_max[self.start_layer],
             self.page_valid[self.start_layer],
@@ -420,7 +513,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             else None
         )
         if cached_selection is not None:
-            self._actual_selection_anchors.add(layer_id)
+            self._mark_actual_selection_anchor(layer_id)
             self._decode_selection_cache_touched = True
             self._selection_cache = cached_selection
             self._selection_cache_group = group
@@ -442,7 +535,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             pending.age = 0
             self._decode_selection_cache_mode = "refresh"
 
-        self._actual_selection_anchors.add(layer_id)
+        self._mark_actual_selection_anchor(layer_id)
         result = super().retrieve_topk(
             queries,
             layer_id,
@@ -480,13 +573,70 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
     ) -> None:
         if forward_batch.forward_mode.is_extend():
             self._invalidate_decode_selection_cache()
-        return super().construct_representations(
-            layer_id,
-            req_pool_indices,
-            seq_lens,
-            k_buffer,
-            forward_batch,
+        if not self._use_layer_representation_trackers:
+            return super().construct_representations(
+                layer_id,
+                req_pool_indices,
+                seq_lens,
+                k_buffer,
+                forward_batch,
+            )
+        if not forward_batch.forward_mode.is_extend():
+            return
+
+        repr_constructed, last_constructed_page = (
+            self.get_layer_representation_trackers(layer_id)
         )
+        if getattr(forward_batch, "extend_prefix_lens", None) is not None:
+            new_req_mask = forward_batch.extend_prefix_lens == 0
+            if new_req_mask.any():
+                new_req_indices = req_pool_indices[new_req_mask]
+                repr_constructed[new_req_indices] = False
+                last_constructed_page[new_req_indices] = 0
+                self.states.repr_constructed[new_req_indices] = False
+                self.states.prompt_lens[new_req_indices] = 0
+                self.states.last_constructed_page[new_req_indices] = 0
+
+        prompt_lens = self.states.prompt_lens[req_pool_indices]
+        self.states.prompt_lens[req_pool_indices] = torch.maximum(prompt_lens, seq_lens)
+        num_pages = seq_lens // self.page_size
+        start_page = torch.where(
+            repr_constructed[req_pool_indices],
+            last_constructed_page[req_pool_indices],
+            torch.zeros_like(num_pages),
+        )
+        valid_mask = (seq_lens >= self.states.prompt_lens[req_pool_indices]) & (
+            num_pages > start_page
+        )
+        if not valid_mask.any():
+            return
+
+        self._compute_page_representations(
+            layer_id,
+            req_pool_indices[valid_mask],
+            seq_lens[valid_mask],
+            start_page[valid_mask],
+            num_pages[valid_mask],
+            k_buffer,
+        )
+        success_indices = req_pool_indices[valid_mask]
+        repr_constructed[success_indices] = True
+        last_constructed_page[success_indices] = num_pages[valid_mask]
+        if layer_id == self.end_layer - 1:
+            self.states.repr_constructed[success_indices] = True
+            self.states.last_constructed_page[success_indices] = num_pages[valid_mask]
+        return None
+
+    def get_layer_representation_trackers(
+        self, layer_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the stable tracker buffers owned by one selection layer."""
+        if self._use_layer_representation_trackers:
+            return (
+                self._layer_repr_constructed[layer_id],
+                self._layer_last_constructed_page[layer_id],
+            )
+        return self.states.repr_constructed, self.states.last_constructed_page
 
     def _can_use_triton_page_update(
         self,
@@ -507,12 +657,15 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         ):
             return False
 
+        repr_constructed, last_constructed_page = (
+            self.get_layer_representation_trackers(self.start_layer)
+        )
         tensors = (
             req_pool_indices,
             seq_lens,
             self.req_to_token_pool.req_to_token,
-            self.states.repr_constructed,
-            self.states.last_constructed_page,
+            repr_constructed,
+            last_constructed_page,
         )
         return all(tensor.device == k_buffer.device for tensor in tensors)
 
@@ -532,7 +685,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         if not self.should_update_representations(forward_batch):
             return
 
-        if not self._is_actual_selection_anchor(layer_id):
+        if not self._is_actual_selection_anchor(layer_id, forward_batch):
             return
 
         if not self._can_use_triton_page_update(req_pool_indices, seq_lens, k_buffer):
@@ -544,11 +697,15 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 forward_batch,
             )
 
-        # Reused layers never consume their own decode-time Quest bounds. Every
-        # actual anchor writes against the same pre-forward tracker snapshot;
-        # finalize_forward advances it only after all anchors have completed.
+        # Default schedules retain the shared pre-forward tracker snapshot.
+        # Context-adaptive schedules own one tracker per layer, so an anchor
+        # restored after several forwards can catch up and advance independently.
         from sglang.srt.mem_cache.sparsity.kernels.quest_page_update import (
             quest_update_page_representations_,
+        )
+
+        repr_constructed, last_constructed_page = (
+            self.get_layer_representation_trackers(layer_id)
         )
 
         quest_update_page_representations_(
@@ -556,13 +713,13 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             seq_lens,
             self.req_to_token_pool.req_to_token,
             k_buffer,
-            self.states.repr_constructed,
-            self.states.last_constructed_page,
+            repr_constructed,
+            last_constructed_page,
             self.page_k_min[layer_id],
             self.page_k_max[layer_id],
             self.page_valid[layer_id],
             self.page_size,
-            advance_trackers=False,
+            advance_trackers=self._use_layer_representation_trackers,
         )
 
     def _update_representations_without_tracker_advance(
@@ -573,12 +730,15 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         k_buffer: torch.Tensor,
         forward_batch,
     ) -> None:
-        """Portable representation update that leaves shared trackers unchanged."""
+        """Portable representation update using the active tracker ownership."""
         end_page = seq_lens // self.page_size
-        constructed = self.states.repr_constructed[req_pool_indices]
+        repr_constructed, last_constructed_page = (
+            self.get_layer_representation_trackers(layer_id)
+        )
+        constructed = repr_constructed[req_pool_indices]
         start_page = torch.where(
             constructed,
-            self.states.last_constructed_page[req_pool_indices],
+            last_constructed_page[req_pool_indices],
             torch.zeros_like(end_page),
         )
         valid_mask = start_page < end_page
@@ -593,6 +753,10 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             end_page[valid_mask],
             k_buffer,
         )
+        if self._use_layer_representation_trackers:
+            success_indices = req_pool_indices[valid_mask]
+            repr_constructed[success_indices] = True
+            last_constructed_page[success_indices] = end_page[valid_mask]
 
     def finalize_forward(self, forward_batch) -> None:
         if not forward_batch.forward_mode.is_decode():
@@ -683,6 +847,13 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             self.page_valid[layer_id] = torch.zeros(
                 total_num_pages, dtype=torch.bool, device=self.device
             )
+            if self._use_layer_representation_trackers:
+                self._layer_repr_constructed[layer_id] = torch.zeros_like(
+                    self.states.repr_constructed
+                )
+                self._layer_last_constructed_page[layer_id] = torch.zeros_like(
+                    self.states.last_constructed_page
+                )
 
         logger.info(
             "Initialized Quest page reps: %d pages, %d layers, head_num=%d, "
@@ -782,6 +953,9 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 quest_lazy_update_page_scores,
             )
 
+            repr_constructed, last_constructed_page = (
+                self.get_layer_representation_trackers(layer_id)
+            )
             return quest_lazy_update_page_scores(
                 queries=queries,
                 page_k_min=self.page_k_min[layer_id],
@@ -792,12 +966,12 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 seq_lens=plan.seq_lens,
                 req_to_token=self.req_to_token_pool.req_to_token,
                 k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
-                repr_constructed=self.states.repr_constructed,
-                last_constructed_page=self.states.last_constructed_page,
+                repr_constructed=repr_constructed,
+                last_constructed_page=last_constructed_page,
                 page_size=self.page_size,
                 active_mask=plan.active_mask,
                 history_page_counts=plan.recent_start,
-                advance_trackers=False,
+                advance_trackers=self._use_layer_representation_trackers,
             )
 
         if self.use_fused_score_mask_kernel and self._can_use_triton_score_kernel(
@@ -838,6 +1012,9 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 quest_lazy_update_page_scores,
             )
 
+            repr_constructed, last_constructed_page = (
+                self.get_layer_representation_trackers(layer_id)
+            )
             return quest_lazy_update_page_scores(
                 queries=queries,
                 page_k_min=self.page_k_min[layer_id],
@@ -848,10 +1025,10 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 seq_lens=plan.seq_lens,
                 req_to_token=self.req_to_token_pool.req_to_token,
                 k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
-                repr_constructed=self.states.repr_constructed,
-                last_constructed_page=self.states.last_constructed_page,
+                repr_constructed=repr_constructed,
+                last_constructed_page=last_constructed_page,
                 page_size=self.page_size,
-                advance_trackers=False,
+                advance_trackers=self._use_layer_representation_trackers,
             )
 
         if self._can_use_triton_score_kernel(queries):

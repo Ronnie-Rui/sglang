@@ -1120,7 +1120,22 @@ class TestQuestLayerReuseAndBudget(unittest.TestCase):
     device = torch.device("cpu")
 
     @staticmethod
-    def _make_wrapper_algorithm(*, interval=1, layer_page_budget=None):
+    def _make_wrapper_algorithm(
+        *,
+        interval=1,
+        layer_page_budget=None,
+        context_adaptive_interval=None,
+        context_adaptive_min_pages=None,
+    ):
+        adaptive_config = {}
+        if context_adaptive_interval is not None:
+            adaptive_config["context_adaptive_layer_selection_reuse_interval"] = (
+                context_adaptive_interval
+            )
+        if context_adaptive_min_pages is not None:
+            adaptive_config["context_adaptive_layer_selection_reuse_min_pages"] = (
+                context_adaptive_min_pages
+            )
         config = _Config(
             page_size=1,
             sparsity_ratio=0.062124249,
@@ -1128,6 +1143,7 @@ class TestQuestLayerReuseAndBudget(unittest.TestCase):
             sparse_extra_config={
                 "layer_selection_reuse_interval": interval,
                 "layer_page_budget": layer_page_budget or [],
+                **adaptive_config,
             },
         )
         algorithm = QuestAlgorithm(config, torch.device("cpu"))
@@ -1191,6 +1207,9 @@ class TestQuestLayerReuseAndBudget(unittest.TestCase):
             return_value=(selected, lengths),
         ) as underlying_retrieve:
             default_algorithm = self._make_wrapper_algorithm()
+            self.assertFalse(default_algorithm._use_layer_representation_trackers)
+            self.assertEqual(default_algorithm._layer_repr_constructed, {})
+            self.assertEqual(default_algorithm._layer_last_constructed_page, {})
             self._call_retrieve(default_algorithm, 1)
             self._call_retrieve(default_algorithm, 2)
             self.assertEqual(underlying_retrieve.call_count, 2)
@@ -1200,6 +1219,243 @@ class TestQuestLayerReuseAndBudget(unittest.TestCase):
             self._call_retrieve(reuse_algorithm, 0)
             self._call_retrieve(reuse_algorithm, 2)
             self.assertEqual(underlying_retrieve.call_count, 4)
+
+    def test_context_adaptive_reuse_uses_only_host_known_page_width(self):
+        selected = torch.tensor([[0]], dtype=torch.int32)
+        lengths = torch.tensor([1], dtype=torch.int32)
+        seq_lens = torch.tensor([16], dtype=torch.int64)
+        algorithm, _ = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+            sparse_extra_config={
+                "layer_selection_reuse_interval": 2,
+                "context_adaptive_layer_selection_reuse_interval": 4,
+                "context_adaptive_layer_selection_reuse_min_pages": 8,
+                "use_lazy_page_update_score_kernel": True,
+            },
+            end_layer=8,
+        )
+        forward_batch = _FakeForwardBatch(seq_lens)
+        req_pool_indices = torch.zeros(1, dtype=torch.long)
+        sparse_mask = torch.ones(1, dtype=torch.bool)
+
+        with (
+            patch.object(
+                BaseSparseAlgorithmImpl,
+                "retrieve_topk",
+                return_value=(selected, lengths),
+            ) as underlying_retrieve,
+            patch.object(algorithm, "_can_enable_lazy_page_update", return_value=True),
+        ):
+            algorithm.begin_forward(
+                forward_batch, req_pool_indices, sparse_mask, self.device
+            )
+            for layer_id in range(8):
+                algorithm.retrieve_topk(
+                    torch.zeros((1, 1, 1)),
+                    layer_id,
+                    req_pool_indices,
+                    sparse_mask,
+                    forward_batch=forward_batch,
+                )
+
+        self.assertTrue(algorithm._context_adaptive_layer_selection_reuse_active)
+        self.assertEqual(algorithm._active_layer_selection_reuse_interval, 4)
+        self.assertEqual(algorithm._actual_selection_anchors, {0, 4})
+        self.assertEqual(underlying_retrieve.call_count, 2)
+
+    def test_context_adaptive_reuse_falls_back_without_host_length_mirror(self):
+        seq_lens = torch.tensor([16], dtype=torch.int64)
+        algorithm, _ = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+            sparse_extra_config={
+                "layer_selection_reuse_interval": 2,
+                "context_adaptive_layer_selection_reuse_interval": 4,
+                "context_adaptive_layer_selection_reuse_min_pages": 8,
+                "use_lazy_page_update_score_kernel": True,
+            },
+            end_layer=8,
+        )
+        forward_batch = _FakeForwardBatch(seq_lens, seq_lens_cpu=False)
+        with patch.object(algorithm, "_can_enable_lazy_page_update", return_value=True):
+            algorithm.begin_forward(
+                forward_batch,
+                torch.zeros(1, dtype=torch.long),
+                torch.ones(1, dtype=torch.bool),
+                self.device,
+            )
+
+        self.assertFalse(algorithm._context_adaptive_layer_selection_reuse_active)
+        self.assertEqual(algorithm._active_layer_selection_reuse_interval, 2)
+
+    def test_context_adaptive_reuse_requires_every_eager_row_to_cross_threshold(self):
+        seq_lens = torch.tensor([16, 4], dtype=torch.int64)
+        algorithm, _ = _make_algorithm(
+            batch_size=2,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+            sparse_extra_config={
+                "layer_selection_reuse_interval": 2,
+                "context_adaptive_layer_selection_reuse_interval": 4,
+                "context_adaptive_layer_selection_reuse_min_pages": 8,
+                "use_lazy_page_update_score_kernel": True,
+            },
+            end_layer=8,
+        )
+        with patch.object(algorithm, "_can_enable_lazy_page_update", return_value=True):
+            algorithm.begin_forward(
+                _FakeForwardBatch(seq_lens),
+                torch.arange(2, dtype=torch.long),
+                torch.ones(2, dtype=torch.bool),
+                self.device,
+            )
+
+        self.assertFalse(algorithm._context_adaptive_layer_selection_reuse_active)
+        self.assertEqual(algorithm._active_layer_selection_reuse_interval, 2)
+
+    def test_context_adaptive_prefill_updates_and_resets_per_layer_trackers(self):
+        seq_lens = torch.tensor([4], dtype=torch.int64)
+        algorithm, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=2,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+            sparse_extra_config={
+                "layer_selection_reuse_interval": 2,
+                "context_adaptive_layer_selection_reuse_interval": 4,
+                "context_adaptive_layer_selection_reuse_min_pages": 2,
+                "use_lazy_page_update_score_kernel": True,
+            },
+            end_layer=4,
+        )
+        req_pool_indices = torch.zeros(1, dtype=torch.long)
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend=lambda: True),
+            extend_prefix_lens=torch.zeros(1, dtype=torch.long),
+        )
+        for layer_id in range(4):
+            algorithm.construct_representations(
+                layer_id,
+                req_pool_indices,
+                seq_lens,
+                k_buffer,
+                forward_batch,
+            )
+
+        for layer_id in range(4):
+            constructed, last_page = algorithm.get_layer_representation_trackers(
+                layer_id
+            )
+            self.assertTrue(constructed[0].item())
+            self.assertEqual(last_page[0].item(), 2)
+
+        shorter_seq_lens = torch.tensor([2], dtype=torch.int64)
+        for layer_id in range(4):
+            algorithm.construct_representations(
+                layer_id,
+                req_pool_indices,
+                shorter_seq_lens,
+                k_buffer,
+                forward_batch,
+            )
+
+        for layer_id in range(4):
+            constructed, last_page = algorithm.get_layer_representation_trackers(
+                layer_id
+            )
+            self.assertTrue(constructed[0].item())
+            self.assertEqual(last_page[0].item(), 1)
+
+    def test_context_adaptive_graph_buckets_keep_independent_anchor_state(self):
+        selected = torch.tensor([[0]], dtype=torch.int32)
+        lengths = torch.tensor([1], dtype=torch.int32)
+        seq_lens = torch.tensor([32], dtype=torch.int64)
+        algorithm, _ = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=1,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=self.device,
+            seed=0,
+            sparse_extra_config={
+                "layer_selection_reuse_interval": 2,
+                "context_adaptive_layer_selection_reuse_interval": 4,
+                "context_adaptive_layer_selection_reuse_min_pages": 8,
+                "use_lazy_page_update_score_kernel": True,
+            },
+            end_layer=8,
+        )
+        forward_batch = _FakeForwardBatch(seq_lens)
+        req_pool_indices = torch.zeros(1, dtype=torch.long)
+        sparse_mask = torch.ones(1, dtype=torch.bool)
+
+        with (
+            patch.object(
+                BaseSparseAlgorithmImpl,
+                "retrieve_topk",
+                return_value=(selected, lengths),
+            ),
+            patch.object(algorithm, "_can_enable_lazy_page_update", return_value=True),
+        ):
+            for capacity in (4, 16):
+                algorithm.begin_forward(
+                    forward_batch,
+                    req_pool_indices,
+                    sparse_mask,
+                    self.device,
+                    fixed_capacity=capacity,
+                )
+                for layer_id in range(8):
+                    algorithm.retrieve_topk(
+                        torch.zeros((1, 1, 1)),
+                        layer_id,
+                        req_pool_indices,
+                        sparse_mask,
+                        forward_batch=forward_batch,
+                    )
+
+        self.assertEqual(
+            algorithm._layer_selection_reuse_graph_intervals, {4: 2, 16: 4}
+        )
+        self.assertEqual(
+            algorithm._actual_selection_anchor_graph_states[4], {0, 2, 4, 6}
+        )
+        self.assertEqual(algorithm._actual_selection_anchor_graph_states[16], {0, 4})
+        short_batch = SimpleNamespace(runtime_sparse_page_capacity=4)
+        long_batch = SimpleNamespace(runtime_sparse_page_capacity=16)
+        self.assertTrue(algorithm._is_actual_selection_anchor(2, short_batch))
+        self.assertFalse(algorithm._is_actual_selection_anchor(2, long_batch))
+        self.assertTrue(algorithm._is_actual_selection_anchor(4, short_batch))
+        self.assertTrue(algorithm._is_actual_selection_anchor(4, long_batch))
 
     def test_lazy_update_reanchors_on_noncontiguous_layer_order(self):
         algorithm = self._make_wrapper_algorithm(interval=4)
@@ -1624,6 +1880,138 @@ class TestQuestLayerReuseAndBudget(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestQuestFixedCapacityCudaGraph(unittest.TestCase):
+    @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
+    def test_context_adaptive_restored_anchor_materializes_missed_pages(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        for use_fixed_capacity in (False, True):
+            with self.subTest(use_fixed_capacity=use_fixed_capacity):
+                long_seq_lens = torch.tensor([6, 4], dtype=torch.int64, device=device)
+                algo, k_buffer = _make_algorithm(
+                    batch_size=2,
+                    seq_lens=long_seq_lens,
+                    page_size=1,
+                    sparsity_ratio=0.5,
+                    num_recent_pages=1,
+                    kv_heads=1,
+                    head_dim=8,
+                    device=device,
+                    seed=101,
+                    sparse_extra_config={
+                        "layer_selection_reuse_interval": 2,
+                        "context_adaptive_layer_selection_reuse_interval": 4,
+                        "context_adaptive_layer_selection_reuse_min_pages": 5,
+                        "use_lazy_page_update_score_kernel": True,
+                    },
+                    end_layer=4,
+                )
+                req_pool_indices = torch.arange(2, dtype=torch.long, device=device)
+                initial_pages = torch.tensor([4, 2], dtype=torch.long, device=device)
+                for layer_id in range(4):
+                    algo._compute_page_representations(
+                        layer_id,
+                        req_pool_indices,
+                        long_seq_lens,
+                        torch.zeros_like(initial_pages),
+                        initial_pages,
+                        k_buffer,
+                    )
+                    constructed, last_page = algo.get_layer_representation_trackers(
+                        layer_id
+                    )
+                    constructed[req_pool_indices] = True
+                    last_page[req_pool_indices] = initial_pages
+                algo.states.repr_constructed[req_pool_indices] = True
+                algo.states.last_constructed_page[req_pool_indices] = initial_pages
+
+                long_batch = _FakeForwardBatch(long_seq_lens)
+                long_batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+                long_batch.req_pool_indices = req_pool_indices
+                long_sparse_mask = torch.ones(2, dtype=torch.bool, device=device)
+                long_capacity = 6 if use_fixed_capacity else False
+                algo.begin_forward(
+                    long_batch,
+                    req_pool_indices,
+                    long_sparse_mask,
+                    device,
+                    fixed_capacity=long_capacity,
+                )
+                self.assertTrue(algo._context_adaptive_layer_selection_reuse_active)
+                long_query = torch.randn((2, 1, 8), device=device)
+                for layer_id in range(4):
+                    algo.retrieve_topk(
+                        long_query,
+                        layer_id,
+                        req_pool_indices,
+                        long_sparse_mask,
+                        forward_batch=long_batch,
+                    )
+                if use_fixed_capacity:
+                    long_batch.runtime_sparse_page_capacity = 6
+                algo.finalize_forward(long_batch)
+                torch.cuda.synchronize()
+
+                _, layer0_last_page = algo.get_layer_representation_trackers(0)
+                _, layer2_last_page = algo.get_layer_representation_trackers(2)
+                torch.testing.assert_close(
+                    layer0_last_page,
+                    torch.tensor([5, 3], dtype=torch.int64, device=device),
+                )
+                torch.testing.assert_close(layer2_last_page, initial_pages)
+
+                short_seq_lens = torch.tensor([4], dtype=torch.int64, device=device)
+                short_req_pool_indices = torch.tensor(
+                    [1], dtype=torch.long, device=device
+                )
+                short_batch = _FakeForwardBatch(short_seq_lens)
+                short_batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+                short_batch.req_pool_indices = short_req_pool_indices
+                short_sparse_mask = torch.ones(1, dtype=torch.bool, device=device)
+                short_capacity = 4 if use_fixed_capacity else False
+                algo.begin_forward(
+                    short_batch,
+                    short_req_pool_indices,
+                    short_sparse_mask,
+                    device,
+                    fixed_capacity=short_capacity,
+                )
+                self.assertFalse(algo._context_adaptive_layer_selection_reuse_active)
+                short_query = torch.randn((1, 1, 8), device=device)
+                fresh_indices, fresh_lengths = algo.retrieve_topk(
+                    short_query,
+                    0,
+                    short_req_pool_indices,
+                    short_sparse_mask,
+                    forward_batch=short_batch,
+                )
+                algo.retrieve_topk(
+                    short_query,
+                    1,
+                    short_req_pool_indices,
+                    short_sparse_mask,
+                    forward_batch=short_batch,
+                )
+                restored_indices, restored_lengths = algo.retrieve_topk(
+                    short_query,
+                    2,
+                    short_req_pool_indices,
+                    short_sparse_mask,
+                    forward_batch=short_batch,
+                )
+                torch.cuda.synchronize()
+
+                torch.testing.assert_close(restored_lengths, fresh_lengths)
+                torch.testing.assert_close(restored_indices, fresh_indices)
+                self.assertEqual(layer2_last_page[1].item(), 3)
+                physical_page = int(algo.req_to_token_pool.req_to_token[1, 2].item())
+                torch.testing.assert_close(
+                    algo.page_k_min[2][physical_page],
+                    algo.page_k_min[0][physical_page],
+                )
+                torch.testing.assert_close(
+                    algo.page_k_max[2][physical_page],
+                    algo.page_k_max[0][physical_page],
+                )
+
     @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
     def test_reuse_updates_only_selection_anchor_representations(self):
         device = torch.device("cuda", torch.cuda.current_device())

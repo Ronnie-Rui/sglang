@@ -25,6 +25,12 @@ QUEST_MAX_SELECTED_TOKENS_OPTION = "quest_max_selected_tokens"
 QUEST_DECODE_TOKEN_SELECTION_REUSE_INTERVAL_OPTION = (
     "decode_token_selection_reuse_interval"
 )
+QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_INTERVAL_OPTION = (
+    "context_adaptive_layer_selection_reuse_interval"
+)
+QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_MIN_PAGES_OPTION = (
+    "context_adaptive_layer_selection_reuse_min_pages"
+)
 
 
 def _load_hisparse_config(server_args: ServerArgs) -> dict:
