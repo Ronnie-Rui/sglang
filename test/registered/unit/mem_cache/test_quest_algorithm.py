@@ -54,7 +54,7 @@ def _build_plan(page_counts, sparse_mask, *, sparsity_ratio=0.25):
         [count * algorithm.page_size for count in page_counts], dtype=torch.int64
     )
     forward_batch = SimpleNamespace(seq_lens=seq_lens, seq_lens_cpu=seq_lens.tolist())
-    plan = algorithm._build_topk_plan(
+    plan = algorithm._build_retrieval_plan(
         forward_batch,
         torch.arange(len(page_counts)),
         torch.tensor(sparse_mask, dtype=torch.bool),
@@ -97,7 +97,7 @@ def test_single_request_uses_low_overhead_retrieval_path():
 
     with patch.object(
         algorithm,
-        "_build_topk_plan",
+        "_build_retrieval_plan",
         side_effect=AssertionError("single-request path built a batched plan"),
     ):
         selected, lengths = algorithm.retrieve_topk(

@@ -58,7 +58,14 @@ def _create_backend_adaptor(
     raise ValueError(f"Unknown attention backend: {backend}")
 
 
-def _parse_sparse_config(server_args) -> SparseConfig:
+def _parse_sparse_config(
+    server_args,
+    *,
+    default_algorithm: Optional[str] = None,
+    default_backend: Optional[str] = None,
+    default_page_size: Optional[int] = None,
+    default_min_sparse_prompt_len: Optional[int] = None,
+) -> SparseConfig:
     """Parse hierarchical sparse config from JSON string.
 
     Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
@@ -72,6 +79,10 @@ def _parse_sparse_config(server_args) -> SparseConfig:
             extra_config = json.loads(extra_config_str)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse hisparse_config: {e}") from e
+        if not isinstance(extra_config, dict):
+            raise ValueError(
+                f"hisparse_config must be a JSON object, got {type(extra_config).__name__}."
+            )
     else:
         extra_config = {}
 
@@ -93,10 +104,16 @@ def _parse_sparse_config(server_args) -> SparseConfig:
             f"swap_in_block_size ({swap_in_block_size}) must be in the range [1, 1024]"
         )
 
-    algorithm = extra_config.pop("algorithm", None)
-    backend = extra_config.pop("backend", None)
-    min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)
-    page_size = extra_config.pop("page_size", None)
+    algorithm = extra_config.pop("algorithm", default_algorithm)
+    backend = extra_config.pop("backend", default_backend)
+    if isinstance(algorithm, str):
+        algorithm = algorithm.strip().lower()
+    if isinstance(backend, str):
+        backend = backend.strip().lower()
+    min_sparse_prompt_len = extra_config.pop(
+        "min_sparse_prompt_len", default_min_sparse_prompt_len
+    )
+    page_size = extra_config.pop("page_size", default_page_size)
 
     return SparseConfig(
         top_k=top_k,
@@ -116,6 +133,100 @@ def parse_hisparse_config(server_args) -> SparseConfig:
     return _parse_sparse_config(server_args)
 
 
+def parse_runtime_sparse_config(server_args) -> SparseConfig:
+    """Parse and validate the runtime Quest configuration."""
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
+    prefill_backend, decode_backend = attention_backends_of(server_args)
+    runtime_page_size = server_args.page_size
+    config = _parse_sparse_config(
+        server_args,
+        default_algorithm="quest",
+        default_backend=decode_backend or prefill_backend,
+        default_page_size=runtime_page_size,
+        default_min_sparse_prompt_len=0,
+    )
+    if not config.algorithm:
+        raise ValueError("Sparse runtime config requires an algorithm.")
+    if not config.backend:
+        raise ValueError("Sparse runtime config requires an attention backend.")
+    if not isinstance(config.page_size, int) or isinstance(config.page_size, bool):
+        raise ValueError(
+            f"Sparse runtime config page_size must be an integer, got {config.page_size!r}."
+        )
+    if config.page_size <= 0:
+        raise ValueError(
+            f"Sparse runtime config page_size must be positive, got {config.page_size}."
+        )
+    if runtime_page_size is not None and config.page_size != runtime_page_size:
+        raise ValueError(
+            "Sparse runtime config page_size must match the runtime KV cache "
+            f"--page-size ({runtime_page_size}), got {config.page_size}."
+        )
+    if config.min_sparse_prompt_len is not None and (
+        not isinstance(config.min_sparse_prompt_len, int)
+        or isinstance(config.min_sparse_prompt_len, bool)
+        or config.min_sparse_prompt_len < 0
+    ):
+        raise ValueError(
+            "Sparse runtime config min_sparse_prompt_len must be a non-negative "
+            f"integer, got {config.min_sparse_prompt_len!r}."
+        )
+
+    sparsity_ratio = config.sparse_extra_config.get("sparsity_ratio")
+    if sparsity_ratio is not None and (
+        not isinstance(sparsity_ratio, (int, float))
+        or isinstance(sparsity_ratio, bool)
+        or not 0 < sparsity_ratio <= 1
+    ):
+        raise ValueError(
+            "Sparse runtime config sparsity_ratio must be in the range (0, 1], "
+            f"got {sparsity_ratio!r}."
+        )
+    num_recent_pages = config.sparse_extra_config.get("num_recent_pages")
+    if num_recent_pages is not None and (
+        not isinstance(num_recent_pages, int)
+        or isinstance(num_recent_pages, bool)
+        or num_recent_pages <= 0
+    ):
+        raise ValueError(
+            "Sparse runtime config num_recent_pages must be a positive integer, "
+            f"got {num_recent_pages!r}."
+        )
+
+    boolean_options = (
+        "use_triton_score_kernel",
+        "use_fused_score_mask_kernel",
+        "enable_cuda_graph_retrieval",
+        "use_triton_page_update_kernel",
+        "use_direct_fa_metadata_kernel",
+        "use_lazy_page_update_score_kernel",
+    )
+    for option in boolean_options:
+        if option in config.sparse_extra_config and not isinstance(
+            config.sparse_extra_config[option], bool
+        ):
+            raise ValueError(
+                f"Sparse runtime config {option} must be a boolean, "
+                f"got {config.sparse_extra_config[option]!r}."
+            )
+
+    context_buckets = config.sparse_extra_config.get("cuda_graph_context_buckets")
+    if context_buckets is not None and (
+        not isinstance(context_buckets, list)
+        or not context_buckets
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in context_buckets
+        )
+    ):
+        raise ValueError(
+            "Sparse runtime config cuda_graph_context_buckets must be a non-empty "
+            f"list of positive integers, got {context_buckets!r}."
+        )
+    return config
+
+
 def create_sparse_coordinator(
     device: torch.device,
     req_to_token_pool,
@@ -123,9 +234,10 @@ def create_sparse_coordinator(
     start_layer: int,
     end_layer: int,
     server_args,
+    max_context_len: Optional[int] = None,
     **kwargs,
 ) -> SparseCoordinator:
-    config = _parse_sparse_config(server_args)
+    config = parse_runtime_sparse_config(server_args)
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     backend_adaptor = _create_backend_adaptor(
         config.backend, device, algorithm, req_to_token_pool
@@ -140,6 +252,7 @@ def create_sparse_coordinator(
         start_layer=start_layer,
         end_layer=end_layer,
         device=device,
+        max_context_len=max_context_len,
     )
     register_sparse_coordinator(coordinator)
     return coordinator

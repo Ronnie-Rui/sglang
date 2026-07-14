@@ -29,8 +29,11 @@ class ShapeKey:
     stream_idx:   pdmux stream index, or None for single-stream runners.
     variant_label: LoRA-variant label ("lora" / "nolora"), or None
         for runners that don't record per-variant graphs.
+    sparse_page_capacity: fixed Quest retrieval width, or None for runners
+        without graph-captured runtime sparse attention.
     """
 
     size: int
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
+    sparse_page_capacity: Optional[int] = None

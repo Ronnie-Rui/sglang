@@ -29,6 +29,12 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.use_fused_score_mask_kernel = config.sparse_extra_config.get(
             "use_fused_score_mask_kernel", True
         )
+        self.enable_cuda_graph_retrieval = config.sparse_extra_config.get(
+            "enable_cuda_graph_retrieval", True
+        )
+        self.use_direct_fa_metadata_kernel = config.sparse_extra_config.get(
+            "use_direct_fa_metadata_kernel", True
+        )
         self.use_triton_page_update_kernel = config.sparse_extra_config.get(
             "use_triton_page_update_kernel", True
         )
@@ -38,6 +44,15 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
+
+    def should_finalize_graph_forward(self, forward_batch) -> bool:
+        plan = self._retrieval_plan
+        return bool(
+            self.enable_cuda_graph_retrieval
+            and plan is not None
+            and plan.forward_batch is forward_batch
+            and plan.fixed_capacity
+        )
 
     def _can_use_triton_page_update(
         self,

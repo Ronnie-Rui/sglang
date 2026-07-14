@@ -22,7 +22,10 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_forward_context,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -183,15 +186,186 @@ class RadixAttention(nn.Module):
                 )
             return output
         else:
-            return get_attn_backend().forward(
-                q,
-                k,
-                v,
+            context = get_forward_context()
+            attn_backend = context.attn_backend
+            runtime_sparse_coordinator = context.runtime_sparse_coordinator
+            if _should_use_runtime_sparse_attention(
                 self,
                 forward_batch,
+                k,
                 save_kv_cache,
-                **kwargs,
+                runtime_sparse_coordinator,
+            ):
+                sparse_forward = (
+                    breakable_sparse_attention_forward
+                    if is_in_breakable_cuda_graph()
+                    and not forward_batch.forward_mode.is_decode()
+                    else sparse_attention_forward
+                )
+                return sparse_forward(
+                    q, k, v, self, forward_batch, save_kv_cache, **kwargs
+                )
+            return _dense_attention_forward(
+                attn_backend, q, k, v, self, forward_batch, save_kv_cache, **kwargs
             )
+
+
+def _should_use_runtime_sparse_attention(
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    key: Optional[torch.Tensor],
+    save_kv_cache: bool,
+    runtime_sparse_coordinator,
+) -> bool:
+    if runtime_sparse_coordinator is None:
+        return False
+    if (
+        not save_kv_cache
+        or key is None
+        or layer.is_cross_attention
+        or layer.attn_type != AttentionType.DECODER
+        or get_tc_piecewise_forward_context() is not None
+        or forward_batch.req_pool_indices is None
+        or forward_batch.seq_lens is None
+    ):
+        return False
+    if _is_capture_mode() and not is_in_breakable_cuda_graph():
+        return False
+    return forward_batch.forward_mode.is_decode() or (
+        forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        and not forward_batch.forward_mode.is_mixed()
+        and not forward_batch.forward_mode.is_split_prefill()
+    )
+
+
+def _is_capture_mode() -> bool:
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+
+    return get_is_capture_mode()
+
+
+def _dense_attention_forward(
+    attn_backend,
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    save_kv_cache: bool,
+    **kwargs,
+) -> torch.Tensor:
+    return attn_backend.forward(
+        q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+    )
+
+
+def sparse_attention_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    save_kv_cache: bool,
+    **kwargs,
+) -> torch.Tensor:
+    context = get_forward_context()
+    attn_backend = context.attn_backend
+    coordinator = context.runtime_sparse_coordinator
+
+    if forward_batch.forward_mode.is_decode():
+        in_breakable_graph = is_in_breakable_cuda_graph()
+        capture_retrieval = in_breakable_graph and coordinator.enable_cuda_graph_retrieval
+        fixed_capacity = (
+            getattr(forward_batch, "runtime_sparse_page_capacity", True)
+            if capture_retrieval
+            else False
+        )
+        attention_begin = (
+            breakable_sparse_attention_begin
+            if in_breakable_graph and not capture_retrieval
+            else sparse_attention_begin
+        )
+        attention_begin(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            fixed_capacity=fixed_capacity,
+            **kwargs,
+        )
+
+    output = _dense_attention_forward(
+        attn_backend, q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+    )
+    if not (forward_batch.forward_mode.is_decode() and is_in_breakable_cuda_graph()):
+        coordinator.attention_end(output, layer, forward_batch)
+    return output
+
+
+_BCG_STABLE_METADATA_FIELDS = (
+    "page_table",
+    "cache_seqlens_int32",
+    "cu_seqlens_q",
+    "cu_seqlens_k",
+    "scheduler_metadata",
+)
+
+
+def _metadata_tensor_addresses(metadata) -> tuple:
+    if metadata is None:
+        return ()
+    return tuple(
+        (name, value.data_ptr() if torch.is_tensor(value) else None)
+        for name in _BCG_STABLE_METADATA_FIELDS
+        if hasattr(metadata, name)
+        for value in (getattr(metadata, name),)
+    )
+
+
+def sparse_attention_begin(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    fixed_capacity: bool | int = False,
+    **kwargs,
+) -> None:
+    context = get_forward_context()
+    attn_backend = context.attn_backend
+    coordinator = context.runtime_sparse_coordinator
+    current_metadata = getattr(attn_backend, "forward_metadata", None)
+    in_breakable_graph = is_in_breakable_cuda_graph()
+    original_addresses = (
+        _metadata_tensor_addresses(current_metadata) if in_breakable_graph else ()
+    )
+    new_metadata = coordinator.attention_begin(
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        current_metadata,
+        fixed_capacity=fixed_capacity,
+        **kwargs,
+    )
+    if new_metadata is None:
+        return
+    if in_breakable_graph:
+        if new_metadata is not current_metadata:
+            raise RuntimeError(
+                "Breakable CUDA Graph sparse attention must rewrite metadata in place."
+            )
+        if _metadata_tensor_addresses(new_metadata) != original_addresses:
+            raise RuntimeError(
+                "Breakable CUDA Graph sparse attention replaced metadata tensors."
+            )
+    attn_backend.forward_metadata = new_metadata
+
+
+breakable_sparse_attention_begin = eager_on_graph(True)(sparse_attention_begin)
+breakable_sparse_attention_forward = eager_on_graph(True)(sparse_attention_forward)
 
 
 @register_custom_op(mutates_args=["output"])

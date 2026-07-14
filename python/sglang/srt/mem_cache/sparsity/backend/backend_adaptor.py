@@ -4,14 +4,19 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+_ENABLE_ASYNC_ASSERT = envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
 
 
 class BackendAdaptor(ABC):
     """Base class for attention backend adaptors."""
+
+    requires_selected_physical_indices = True
 
     def __init__(self, device: torch.device):
         self.device = device
@@ -32,6 +37,7 @@ class BackendAdaptor(ABC):
         req_to_token: torch.Tensor,
         page_size: int,
         layer_id: int,
+        selected_physical_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Any:
         """
@@ -67,6 +73,7 @@ class DSABackendAdaptor(BackendAdaptor):
         req_to_token: torch.Tensor,
         page_size: int,
         layer_id: int,
+        selected_physical_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """
@@ -79,13 +86,35 @@ class DSABackendAdaptor(BackendAdaptor):
 class FlashAttentionAdaptor(BackendAdaptor):
     """Adaptor for FlashAttention backend."""
 
+    requires_selected_physical_indices = False
+
+    def __init__(self, device: torch.device):
+        super().__init__(device)
+        self._metadata_prepared = False
+        self._page_table_update_mask = None
+        self._max_selected = None
+        self._valid_lengths = None
+
+    def _reset_forward_state(self) -> None:
+        self._metadata_prepared = False
+        self._page_table_update_mask = None
+        self._max_selected = None
+        self._valid_lengths = None
+
     def save_original_metadata(self, metadata: Any) -> None:
+        self._reset_forward_state()
+        required_attrs = ("page_table", "cache_seqlens_int32", "cu_seqlens_k")
+        if metadata is None or not all(
+            hasattr(metadata, attr) for attr in required_attrs
+        ):
+            self._original_metadata = None
+            return
         self._original_metadata = {
-            "page_table": metadata.page_table.clone(),
             "cache_seqlens_int32": metadata.cache_seqlens_int32.clone(),
-            "cu_seqlens_k": metadata.cu_seqlens_k.clone(),
             "max_seq_len_k": metadata.max_seq_len_k,
         }
+        if hasattr(metadata, "scheduler_metadata"):
+            metadata.scheduler_metadata = None
 
     def adapt_for_attn_metadata(
         self,
@@ -97,6 +126,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
         req_to_token: torch.Tensor,
         page_size: int,
         layer_id: int,
+        selected_physical_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Any:
         """
@@ -110,47 +140,132 @@ class FlashAttentionAdaptor(BackendAdaptor):
         if self._original_metadata is None:
             return current_metadata
 
-        if not sparse_mask.any():
+        max_selected = selected_indices.shape[1]
+        metadata_prepared = bool(kwargs.get("metadata_prepared", False))
+        if metadata_prepared:
+            if not self._metadata_prepared:
+                self._max_selected = max_selected
+                self._valid_lengths = valid_lengths
+                current_metadata.max_seq_len_k = max(
+                    self._original_metadata["max_seq_len_k"],
+                    max_selected * page_size,
+                )
+                self._metadata_prepared = True
+            elif max_selected != self._max_selected:
+                raise ValueError("Sparse selection width changed within one forward")
+            elif _ENABLE_ASYNC_ASSERT:
+                torch._assert_async(
+                    (valid_lengths == self._valid_lengths).all(),
+                    "Sparse valid lengths changed between layers in one forward.",
+                )
             return current_metadata
 
-        current_metadata.page_table.copy_(self._original_metadata["page_table"])
-        current_metadata.cache_seqlens_int32.copy_(
-            self._original_metadata["cache_seqlens_int32"]
-        )
+        use_triton_metadata_kernel = all(
+            tensor.is_cuda
+            for tensor in (
+                selected_indices,
+                valid_lengths,
+                sparse_mask,
+                forward_batch.seq_lens,
+                forward_batch.req_pool_indices,
+                req_to_token,
+                current_metadata.page_table,
+                current_metadata.cache_seqlens_int32,
+                current_metadata.cu_seqlens_k,
+            )
+        ) and torch.version.hip is None
+        if use_triton_metadata_kernel:
+            update_lengths = bool(
+                kwargs.get("update_metadata_lengths", not self._metadata_prepared)
+            ) and not self._metadata_prepared
+            if not self._metadata_prepared:
+                self._max_selected = max_selected
+                self._valid_lengths = valid_lengths
+            elif max_selected != self._max_selected:
+                raise ValueError("Sparse selection width changed within one forward")
 
-        physical_pages = self._logical_to_physical_pages_batch(
-            selected_indices,
-            forward_batch.req_pool_indices,
-            req_to_token,
-            page_size,
-        )
+            from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
+                quest_update_flashattention_metadata_,
+            )
 
+            quest_update_flashattention_metadata_(
+                selected_indices=selected_indices,
+                valid_lengths=valid_lengths,
+                sparse_mask=sparse_mask,
+                seq_lens=forward_batch.seq_lens,
+                req_pool_indices=forward_batch.req_pool_indices,
+                req_to_token=req_to_token,
+                page_table=current_metadata.page_table,
+                cache_seqlens_int32=current_metadata.cache_seqlens_int32,
+                cu_seqlens_k=current_metadata.cu_seqlens_k,
+                page_size=page_size,
+                update_lengths=update_lengths,
+                selected_indices_are_physical=False,
+            )
+            if not self._metadata_prepared:
+                current_metadata.max_seq_len_k = max(
+                    self._original_metadata["max_seq_len_k"],
+                    max_selected * page_size,
+                )
+                self._metadata_prepared = True
+            return current_metadata
+
+        physical_pages = selected_physical_indices
+        if physical_pages is None:
+            physical_pages = self._logical_to_physical_pages_batch(
+                selected_indices,
+                forward_batch.req_pool_indices,
+                req_to_token,
+                page_size,
+            )
         max_selected = physical_pages.shape[1]
-        valid_mask = torch.arange(max_selected, device=physical_pages.device).unsqueeze(
-            0
-        ) < valid_lengths.unsqueeze(1)
-        update_mask = sparse_mask.unsqueeze(1) & valid_mask
+        if not self._metadata_prepared:
+            active_sparse_mask = sparse_mask & (valid_lengths > 0)
+            valid_mask = (
+                torch.arange(max_selected, device=physical_pages.device).unsqueeze(0)
+                < valid_lengths.unsqueeze(1)
+            )
+            self._page_table_update_mask = active_sparse_mask.unsqueeze(1) & valid_mask
+            self._max_selected = max_selected
+            self._valid_lengths = valid_lengths
 
-        current_metadata.page_table[:, :max_selected] = torch.where(
-            update_mask, physical_pages, current_metadata.page_table[:, :max_selected]
+            seq_lens = forward_batch.seq_lens
+            positions_in_page = (seq_lens - 1) % page_size
+            sparse_seq_lens = (
+                valid_lengths * page_size - (page_size - positions_in_page - 1)
+            ).to(torch.int32)
+            current_metadata.cache_seqlens_int32.copy_(
+                torch.where(
+                    active_sparse_mask,
+                    sparse_seq_lens,
+                    self._original_metadata["cache_seqlens_int32"],
+                )
+            )
+            current_metadata.cu_seqlens_k[0].zero_()
+            current_metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(
+                    current_metadata.cache_seqlens_int32,
+                    dim=0,
+                    dtype=torch.int32,
+                )
+            )
+            current_metadata.max_seq_len_k = max(
+                self._original_metadata["max_seq_len_k"],
+                max_selected * page_size,
+            )
+            self._metadata_prepared = True
+        elif max_selected != self._max_selected:
+            raise ValueError("Sparse selection width changed within one forward")
+        elif _ENABLE_ASYNC_ASSERT:
+            torch._assert_async(
+                (valid_lengths == self._valid_lengths).all(),
+                "Sparse valid lengths changed between layers in one forward.",
+            )
+
+        page_table = current_metadata.page_table[:, :max_selected]
+        page_table.copy_(
+            torch.where(self._page_table_update_mask, physical_pages, page_table)
         )
-
-        seq_lens = forward_batch.seq_lens
-        positions_in_page = (seq_lens - 1) % page_size
-        diff = page_size - positions_in_page - 1
-        sparse_seq_lens = (valid_lengths * page_size - diff).to(torch.int32)
-
-        current_metadata.cache_seqlens_int32 = torch.where(
-            sparse_mask, sparse_seq_lens, self._original_metadata["cache_seqlens_int32"]
-        )
-
-        current_metadata.cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(
-                current_metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-            ),
-            (1, 0),
-        )
-        current_metadata.max_seq_len_k = int(current_metadata.cache_seqlens_int32.max())
         return current_metadata
 
     def _logical_to_physical_pages_batch(

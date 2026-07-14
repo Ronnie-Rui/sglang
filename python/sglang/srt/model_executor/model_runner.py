@@ -24,6 +24,7 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.srt.arg_groups.hisparse_hook import use_runtime_sparse_attention
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -277,7 +278,10 @@ class ModelRunner:
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        self.enable_runtime_sparse_attention = use_runtime_sparse_attention(server_args)
+        self.enable_hisparse = (
+            server_args.enable_hisparse and not self.enable_runtime_sparse_attention
+        )
 
         self.init_remote_instance_weight_transporter()
 
@@ -343,6 +347,7 @@ class ModelRunner:
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
+        self.runtime_sparse_coordinator = None
 
         # Load model weights and configure
         self.initialize()
@@ -670,6 +675,7 @@ class ModelRunner:
         self.init_ngram_embedding_manager()
 
         self.maybe_init_hisparse_coordinator()
+        self.maybe_init_runtime_sparse_coordinator()
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
@@ -699,6 +705,22 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+        )
+
+    def maybe_init_runtime_sparse_coordinator(self):
+        if not self.enable_runtime_sparse_attention:
+            return
+
+        from sglang.srt.mem_cache.sparsity import create_sparse_coordinator
+
+        self.runtime_sparse_coordinator = create_sparse_coordinator(
+            device=self.device,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            server_args=self.server_args,
+            max_context_len=self.model_config.context_len,
         )
 
     def post_capture_resize_kv_pool(self):
@@ -1285,7 +1307,12 @@ class ModelRunner:
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
-            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+            ctx_mgr = forward_context(
+                ForwardContext(
+                    attn_backend=self.attn_backend,
+                    runtime_sparse_coordinator=self.runtime_sparse_coordinator,
+                )
+            )
         with ctx_mgr:
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
@@ -1312,6 +1339,8 @@ class ModelRunner:
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+                if self.runtime_sparse_coordinator is not None:
+                    self.runtime_sparse_coordinator.forward_end(forward_batch)
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -1365,6 +1394,11 @@ class ModelRunner:
                 ret = self.eager_runner.execute(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
+                if (
+                    forward_batch.forward_mode.is_decode()
+                    and self.runtime_sparse_coordinator is not None
+                ):
+                    self.runtime_sparse_coordinator.finalize_forward(forward_batch)
 
             if (
                 forward_batch.global_num_tokens_cpu is not None

@@ -17,10 +17,20 @@ def _float32_scaled_count(count: int, ratio: float) -> int:
 
 
 @dataclass
-class _TopKPlan:
-    """Temporary tensors needed by one batched page-selection call."""
+class _RetrievalPlan:
+    """Layer-invariant inputs for one sparse decode forward."""
 
+    forward_batch: "ForwardBatch"
+    batch_size: int
+    device: torch.device
+    seq_lens: torch.Tensor
+    seq_lens_cpu: list[int] | None
+    req_pool_indices: torch.Tensor
+    sparse_mask: torch.Tensor
+    num_pages: torch.Tensor
+    num_pages_cpu: list[int] | None
     max_num_pages: int
+    page_idx: torch.Tensor
     physical_pages: torch.Tensor
     valid_page_mask: torch.Tensor
     active_mask: torch.Tensor
@@ -30,9 +40,9 @@ class _TopKPlan:
     max_k: int
     score_order_required: bool
     recent_idx: torch.Tensor
+    recent_idx_i32: torch.Tensor | None
     recent_valid: torch.Tensor
-    req_pool_indices: torch.Tensor
-    seq_lens: torch.Tensor
+    fixed_capacity: bool
 
 
 class BaseSparseAlgorithm(ABC):
@@ -56,6 +66,33 @@ class BaseSparseAlgorithm(ABC):
         self.device = device
         self.req_to_token_pool = None
         self.states = None
+
+    def begin_forward(
+        self,
+        forward_batch: "ForwardBatch",
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        device: torch.device,
+        fixed_capacity: bool | int = False,
+    ) -> None:
+        """Prepare state shared by every sparse layer in one forward."""
+
+    def should_update_representations(self, forward_batch: "ForwardBatch") -> bool:
+        return True
+
+    def finalize_forward(self, forward_batch: "ForwardBatch") -> None:
+        """Finalize representation trackers after all layers have run."""
+
+    def should_finalize_graph_forward(self, forward_batch: "ForwardBatch") -> bool:
+        return False
+
+    def should_update_metadata_lengths(self, layer_id: int) -> bool:
+        return layer_id == getattr(self, "start_layer", layer_id)
+
+    def get_selected_physical_pages(
+        self, selected_indices: torch.Tensor
+    ) -> torch.Tensor | None:
+        return None
 
     def initialize_representation_pool(
         self,
@@ -193,6 +230,60 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         self.sparsity_ratio = config.sparse_extra_config.get("sparsity_ratio", 0.7)
         self.num_recent_pages = config.sparse_extra_config.get("num_recent_pages", 4)
         self.page_size = config.page_size
+        self._retrieval_plan: _RetrievalPlan | None = None
+        self._representation_update_batch = None
+        self._representation_update_due: bool | None = None
+
+    def begin_forward(
+        self,
+        forward_batch: "ForwardBatch",
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        device: torch.device,
+        fixed_capacity: bool | int = False,
+    ) -> None:
+        self._representation_update_batch = forward_batch
+        if self.req_to_token_pool is None:
+            self._retrieval_plan = None
+            self._representation_update_due = self._decode_page_boundary_reached(
+                forward_batch
+            )
+            return
+        self._retrieval_plan = self._build_retrieval_plan(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            device,
+            fixed_capacity=fixed_capacity,
+        )
+        self._representation_update_due = self._has_completed_page(
+            self._retrieval_plan.seq_lens_cpu
+        )
+
+    def get_selected_physical_pages(
+        self, selected_indices: torch.Tensor
+    ) -> torch.Tensor | None:
+        plan = self._retrieval_plan
+        if (
+            plan is None
+            or selected_indices.ndim != 2
+            or plan.physical_pages.shape[0] != selected_indices.shape[0]
+        ):
+            return None
+        if plan.physical_pages.shape[1] == 0:
+            return torch.zeros_like(selected_indices, dtype=torch.int32)
+
+        logical_pages = selected_indices.to(torch.long)
+        physical_pages = torch.gather(
+            plan.physical_pages,
+            1,
+            logical_pages.clamp(min=0, max=plan.physical_pages.shape[1] - 1),
+        )
+        return torch.where(
+            logical_pages >= 0,
+            physical_pages,
+            torch.zeros_like(physical_pages),
+        ).to(torch.int32)
 
     def initialize_representation_pool(
         self,
@@ -226,11 +317,24 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if not forward_batch.forward_mode.is_extend():
             return
 
+        if getattr(forward_batch, "extend_prefix_lens", None) is not None:
+            new_req_mask = forward_batch.extend_prefix_lens == 0
+            if new_req_mask.any():
+                new_req_indices = req_pool_indices[new_req_mask]
+                self.states.repr_constructed[new_req_indices] = False
+                self.states.prompt_lens[new_req_indices] = 0
+                self.states.last_constructed_page[new_req_indices] = 0
+
+        prompt_lens = self.states.prompt_lens[req_pool_indices]
+        self.states.prompt_lens[req_pool_indices] = torch.maximum(prompt_lens, seq_lens)
         num_pages = seq_lens // self.page_size
-        valid_mask = (
-            ~self.states.repr_constructed[req_pool_indices]
-            & (seq_lens >= self.states.prompt_lens[req_pool_indices])
-            & (num_pages > 0)
+        start_page = torch.where(
+            self.states.repr_constructed[req_pool_indices],
+            self.states.last_constructed_page[req_pool_indices],
+            torch.zeros_like(num_pages),
+        )
+        valid_mask = (seq_lens >= self.states.prompt_lens[req_pool_indices]) & (
+            num_pages > start_page
         )
 
         if not valid_mask.any():
@@ -241,7 +345,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             layer_id,
             req_pool_indices[valid_mask],
             seq_lens[valid_mask],
-            0,
+            start_page[valid_mask],
             num_pages[valid_mask],
             k_buffer,
         )
@@ -260,14 +364,20 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         k_buffer,
         forward_batch,
     ) -> torch.Tensor:
-        if not forward_batch.forward_mode.is_decode_or_idle():
+        if not forward_batch.forward_mode.is_decode():
             return
 
-        start_page = self.states.last_constructed_page[req_pool_indices]
+        if not self.should_update_representations(forward_batch):
+            return
+
         end_page = seq_lens // self.page_size
-        valid_mask = self.states.repr_constructed[req_pool_indices] & (
-            start_page < end_page
+        constructed = self.states.repr_constructed[req_pool_indices]
+        start_page = torch.where(
+            constructed,
+            self.states.last_constructed_page[req_pool_indices],
+            torch.zeros_like(end_page),
         )
+        valid_mask = start_page < end_page
 
         if not valid_mask.any():
             return
@@ -285,6 +395,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         # Update tracking states
         if layer_id == self.end_layer - 1:
             success_indices = req_pool_indices[valid_mask]
+            self.states.repr_constructed[success_indices] = True
             self.states.last_constructed_page[success_indices] = end_page[valid_mask]
 
     def retrieve_topk(
@@ -303,10 +414,12 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             raise ValueError(
                 "forward_batch with seq_lens is required for TopK retrieval"
             )
+        plan = self._retrieval_plan
         if (
             bs == 1
             and self._get_num_pages_cpu(seq_lens_source, 1) is not None
             and not getattr(self, "use_lazy_page_update_score_kernel", False)
+            and (plan is None or not plan.fixed_capacity)
         ):
             return self._retrieve_topk_single(
                 queries,
@@ -316,12 +429,19 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
                 seq_lens_source,
             )
 
-        plan = self._build_topk_plan(
-            seq_lens_source,
-            req_pool_indices,
-            sparse_mask,
-            device,
-        )
+        if (
+            plan is None
+            or plan.forward_batch is not seq_lens_source
+            or plan.batch_size != bs
+            or plan.device != device
+        ):
+            plan = self._build_retrieval_plan(
+                seq_lens_source,
+                req_pool_indices,
+                sparse_mask,
+                device,
+            )
+            self._retrieval_plan = plan
         if plan.max_num_pages <= self.num_recent_pages or plan.max_k <= 0:
             return self._empty_retrieval(bs, device)
 
@@ -333,15 +453,114 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             sorted=plan.score_order_required,
         )
 
+        direct_result = self._try_finalize_to_flashattention_metadata(
+            topk_scores,
+            topk_idx,
+            plan,
+            kwargs.get("attn_metadata"),
+            layer_id,
+        )
+        if direct_result is not None:
+            return direct_result
+        return self._finalize_topk_with_recent(topk_scores, topk_idx, plan)
+
+    def _try_finalize_to_flashattention_metadata(
+        self,
+        topk_scores: torch.Tensor,
+        topk_idx: torch.Tensor,
+        plan: _RetrievalPlan,
+        attn_metadata,
+        layer_id: int,
+    ) -> tuple | None:
+        if (
+            not getattr(self, "use_direct_fa_metadata_kernel", False)
+            or attn_metadata is None
+            or not plan.fixed_capacity
+            or not topk_scores.is_cuda
+            or torch.version.hip is not None
+            or topk_scores.dtype != torch.float32
+            or topk_idx.dtype not in (torch.int32, torch.int64)
+            or plan.k_per_req.dtype not in (torch.int32, torch.int64)
+        ):
+            return None
+
+        required_attrs = ("page_table", "cache_seqlens_int32", "cu_seqlens_k")
+        if not all(hasattr(attn_metadata, attr) for attr in required_attrs):
+            return None
+
+        recent_indices = (
+            plan.recent_idx_i32 if plan.recent_idx_i32 is not None else plan.recent_idx
+        )
+        combined_width = topk_scores.shape[1] + recent_indices.shape[1]
+        from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
+            QUEST_DIRECT_METADATA_MAX_WIDTH,
+            quest_finalize_to_flashattention_metadata_,
+        )
+
+        if (
+            combined_width > QUEST_DIRECT_METADATA_MAX_WIDTH
+            or attn_metadata.page_table.shape[0] != plan.batch_size
+            or attn_metadata.page_table.shape[1] < combined_width
+            or not attn_metadata.page_table.is_cuda
+            or not attn_metadata.cache_seqlens_int32.is_cuda
+            or not attn_metadata.cu_seqlens_k.is_cuda
+        ):
+            return None
+
+        valid_lengths = torch.empty(
+            plan.batch_size, dtype=torch.int32, device=topk_scores.device
+        )
+        quest_finalize_to_flashattention_metadata_(
+            topk_scores=topk_scores,
+            topk_indices=topk_idx,
+            k_per_req=plan.k_per_req,
+            recent_indices=recent_indices,
+            recent_valid=plan.recent_valid,
+            valid_lengths=valid_lengths,
+            sparse_mask=plan.sparse_mask,
+            seq_lens=plan.seq_lens,
+            req_pool_indices=plan.req_pool_indices,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            page_table=attn_metadata.page_table,
+            cache_seqlens_int32=attn_metadata.cache_seqlens_int32,
+            cu_seqlens_k=attn_metadata.cu_seqlens_k,
+            page_size=self.page_size,
+            update_lengths=self.should_update_metadata_lengths(layer_id),
+        )
+        return attn_metadata.page_table[:, :combined_width], valid_lengths, True
+
+    def _finalize_topk_with_recent(
+        self,
+        topk_scores: torch.Tensor,
+        topk_idx: torch.Tensor,
+        plan: _RetrievalPlan,
+    ) -> tuple:
+        combined_width = topk_scores.shape[1] + plan.recent_idx.shape[1]
+        if plan.fixed_capacity and topk_scores.is_cuda and torch.version.hip is None:
+            from sglang.srt.mem_cache.sparsity.kernels.quest_finalize import (
+                QUEST_FINALIZE_MAX_WIDTH,
+                quest_finalize_selected_pages,
+            )
+
+            if combined_width <= QUEST_FINALIZE_MAX_WIDTH:
+                return quest_finalize_selected_pages(
+                    topk_scores,
+                    topk_idx,
+                    plan.k_per_req,
+                    plan.recent_idx,
+                    plan.recent_valid,
+                )
+
+        device = topk_scores.device
         topk_idx = topk_idx.to(torch.long)
         topk_rank = torch.arange(plan.max_k, device=device, dtype=torch.long)
         topk_valid = (
             topk_rank.unsqueeze(0) < plan.k_per_req.unsqueeze(1)
         ) & torch.isfinite(topk_scores)
-        combined_idx = torch.cat([topk_idx, plan.recent_idx], dim=1)
-        combined_valid = torch.cat([topk_valid, plan.recent_valid], dim=1)
         return self._finalize_selected_pages(
-            combined_idx, combined_valid, plan.max_num_pages
+            torch.cat([topk_idx, plan.recent_idx], dim=1),
+            torch.cat([topk_valid, plan.recent_valid], dim=1),
+            plan.max_num_pages,
         )
 
     def _retrieve_topk_single(
@@ -410,22 +629,34 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         )
         return out_indices, lengths
 
-    def _build_topk_plan(
+    def _build_retrieval_plan(
         self,
         forward_batch: "ForwardBatch",
         req_pool_indices: torch.Tensor,
         sparse_mask: torch.Tensor,
         device: torch.device,
-    ) -> _TopKPlan:
-        """Vectorize ragged request metadata without retaining forward state."""
+        *,
+        fixed_capacity: bool | int = False,
+    ) -> _RetrievalPlan:
+        """Build page mapping and selection widths once per forward."""
         batch_size = req_pool_indices.numel()
         seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.long)
+        seq_lens_cpu = (
+            None if fixed_capacity else self._get_seq_lens_cpu(forward_batch, batch_size)
+        )
         req_pool_indices = req_pool_indices.to(device=device, dtype=torch.long)
         sparse_mask_source = sparse_mask
         sparse_mask = sparse_mask.to(device=device, dtype=torch.bool)
         num_pages = (seq_lens + self.page_size - 1) // self.page_size
 
-        num_pages_cpu = self._get_num_pages_cpu(forward_batch, batch_size)
+        num_pages_cpu = (
+            [
+                max((seq_len + self.page_size - 1) // self.page_size, 0)
+                for seq_len in seq_lens_cpu
+            ]
+            if seq_lens_cpu is not None
+            else None
+        )
         sparse_mask_cpu = (
             self._get_bool_mask_cpu(
                 sparse_mask_source,
@@ -435,11 +666,22 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             if num_pages_cpu is not None
             else None
         )
-        max_num_pages = (
-            max(num_pages_cpu, default=0)
-            if num_pages_cpu is not None
-            else int(num_pages.max().item()) if batch_size > 0 else 0
-        )
+        if fixed_capacity:
+            max_context_len = self.req_to_token_pool.max_context_len
+            pool_max_pages = getattr(
+                self,
+                "cuda_graph_max_num_pages",
+                max(max_context_len // self.page_size, 1),
+            )
+            max_num_pages = (
+                pool_max_pages
+                if isinstance(fixed_capacity, bool)
+                else min(fixed_capacity, pool_max_pages)
+            )
+        elif num_pages_cpu is not None:
+            max_num_pages = max(num_pages_cpu, default=0)
+        else:
+            max_num_pages = int(num_pages.max().item()) if batch_size > 0 else 0
         page_idx = torch.arange(max_num_pages, device=device, dtype=torch.long)
         valid_page_mask = page_idx.unsqueeze(0) < num_pages.unsqueeze(1)
 
@@ -476,7 +718,21 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         k_per_req = torch.minimum(k_per_req, history_pages.to(torch.int32))
         k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
 
-        if num_pages_cpu is not None:
+        if fixed_capacity:
+            history_capacity = max(max_num_pages - self.num_recent_pages, 0)
+            max_k = (
+                min(
+                    max(
+                        _float32_scaled_count(history_capacity, self.sparsity_ratio),
+                        1,
+                    ),
+                    history_capacity,
+                )
+                if history_capacity > 0
+                else 0
+            )
+            score_order_required = True
+        elif num_pages_cpu is not None:
             k_per_req_cpu = []
             for row, count in enumerate(num_pages_cpu):
                 # Without an existing host mask, size the output conservatively.
@@ -510,9 +766,24 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             self.num_recent_pages, device=device, dtype=torch.long
         )
         recent_idx = recent_start.unsqueeze(1) + recent_offsets.unsqueeze(0)
+        recent_idx_i32 = (
+            recent_idx.to(torch.int32)
+            if k_per_req.dtype == torch.int32 and bool(fixed_capacity)
+            else None
+        )
         recent_valid = active_mask.unsqueeze(1) & (recent_idx < num_pages.unsqueeze(1))
-        return _TopKPlan(
+        return _RetrievalPlan(
+            forward_batch=forward_batch,
+            batch_size=batch_size,
+            device=device,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            req_pool_indices=req_pool_indices,
+            sparse_mask=sparse_mask,
+            num_pages=num_pages,
+            num_pages_cpu=num_pages_cpu,
             max_num_pages=max_num_pages,
+            page_idx=page_idx,
             physical_pages=physical_pages,
             valid_page_mask=valid_page_mask,
             active_mask=active_mask,
@@ -522,9 +793,9 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             max_k=max_k,
             score_order_required=score_order_required,
             recent_idx=recent_idx,
+            recent_idx_i32=recent_idx_i32,
             recent_valid=recent_valid,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
+            fixed_capacity=bool(fixed_capacity),
         )
 
     @staticmethod
@@ -559,6 +830,16 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
     def _get_num_pages_cpu(
         self, forward_batch: "ForwardBatch", batch_size: int
     ) -> list[int] | None:
+        values = self._get_seq_lens_cpu(forward_batch, batch_size)
+        if values is None:
+            return None
+        return [
+            max((value + self.page_size - 1) // self.page_size, 0)
+            for value in values
+        ]
+
+    @staticmethod
+    def _get_seq_lens_cpu(forward_batch: "ForwardBatch", batch_size: int):
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is None:
             return None
@@ -573,32 +854,46 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
                 return None
             if len(values) != batch_size:
                 return None
-        return [
-            max((int(value) + self.page_size - 1) // self.page_size, 0)
-            for value in values
-        ]
+        return [int(value) for value in values]
 
     def should_update_representations(self, forward_batch: "ForwardBatch") -> bool:
-        """Skip only proven single-token decodes that cannot complete a page."""
-        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-        if seq_lens_cpu is None:
-            return True
-        if torch.is_tensor(seq_lens_cpu):
-            if seq_lens_cpu.device.type != "cpu":
-                return True
-            values = seq_lens_cpu.reshape(-1).tolist()
-        else:
-            try:
-                values = list(seq_lens_cpu)
-            except TypeError:
-                return True
+        if self._representation_update_batch is not forward_batch:
+            self._representation_update_batch = forward_batch
+            self._representation_update_due = self._decode_page_boundary_reached(
+                forward_batch
+            )
+        return self._representation_update_due is not False
 
-        batch_size = len(values)
+    def _decode_page_boundary_reached(
+        self, forward_batch: "ForwardBatch"
+    ) -> bool | None:
+        """Skip only proven single-token decodes that cannot complete a page."""
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if seq_lens is not None:
+            batch_size = seq_lens.numel()
+        else:
+            host_seq_lens = getattr(forward_batch, "seq_lens_cpu", None)
+            try:
+                batch_size = (
+                    host_seq_lens.numel()
+                    if torch.is_tensor(host_seq_lens)
+                    else len(host_seq_lens)
+                )
+            except TypeError:
+                return None
+        values = self._get_seq_lens_cpu(forward_batch, batch_size)
+        if values is None:
+            return None
         if self._may_process_multiple_decode_tokens(forward_batch, batch_size):
             return True
+        return self._has_completed_page(values)
+
+    def _has_completed_page(self, seq_lens_cpu: list[int] | None) -> bool | None:
+        if seq_lens_cpu is None:
+            return None
         return any(
-            int(seq_len) > 0 and int(seq_len) % self.page_size == 0
-            for seq_len in values
+            seq_len > 0 and seq_len % self.page_size == 0
+            for seq_len in seq_lens_cpu
         )
 
     @staticmethod
@@ -629,7 +924,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         return False
 
     def _retrieve_page_scores_batched(
-        self, layer_id: int, queries: torch.Tensor, plan: _TopKPlan
+        self, layer_id: int, queries: torch.Tensor, plan: _RetrievalPlan
     ) -> torch.Tensor:
         scores = self._retrieve_page_scores(
             layer_id,

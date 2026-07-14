@@ -176,6 +176,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             dsa_prefill_backend=None,
             dsa_decode_backend=None,
             enable_hisparse=True,
+            hisparse_config=None,
         )
         defaults.update(kw)
         view = ResolvedView(
@@ -228,6 +229,16 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
         self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_quest_runtime_skips_dsa_backend_defaults(self, _mock_is_hip):
+        resolved = self._resolve(
+            "bfloat16",
+            hisparse_config=('{"algorithm":"quest","backend":"fa3","page_size":16}'),
+        )
+
+        self.assertIsNone(resolved["dsa_prefill_backend"])
+        self.assertIsNone(resolved["dsa_decode_backend"])
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
