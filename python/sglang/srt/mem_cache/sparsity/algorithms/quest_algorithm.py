@@ -1138,7 +1138,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         queries: torch.Tensor,
     ) -> torch.Tensor:
         physical_pages = phys_pages
-        plan = self._retrieval_plan
+        plan = getattr(self, "_retrieval_plan", None)
         if plan is not None:
             superpage_scores = self._try_superpage_page_scores(layer_id, queries, plan)
             if superpage_scores is not None:
