@@ -888,6 +888,72 @@ class TestQuestDecodeTokenSelectionReuse(unittest.TestCase):
             torch.ones(batch_size, dtype=torch.int32),
         )
 
+    def test_dense_forward_updates_bounds_before_sparse_transition(self):
+        algorithm, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=torch.tensor([20], dtype=torch.int64),
+            page_size=4,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=2,
+            device=self.device,
+            seed=31,
+            sparse_extra_config={"layer_selection_reuse_interval": 1},
+            end_layer=2,
+        )
+        req_pool_indices = torch.tensor([0], dtype=torch.int64)
+        algorithm.states.repr_constructed[0] = True
+        algorithm.states.last_constructed_page[0] = 3
+        k_buffer[12:16].fill_(100)
+        for layer_id in range(2):
+            algorithm._compute_page_representations(
+                layer_id,
+                req_pool_indices,
+                torch.tensor([12], dtype=torch.int64),
+                torch.tensor([0], dtype=torch.int64),
+                torch.tensor([3], dtype=torch.int64),
+                k_buffer,
+            )
+
+        dense_batch = self._make_decode_batch([16])
+        algorithm.begin_dense_forward(dense_batch)
+        for layer_id in range(2):
+            algorithm.update_representations(
+                layer_id,
+                req_pool_indices,
+                dense_batch.seq_lens,
+                k_buffer,
+                dense_batch,
+            )
+        algorithm.finalize_forward(dense_batch)
+
+        self.assertEqual(algorithm.states.last_constructed_page.tolist(), [4])
+        physical_page = (
+            int(algorithm.req_to_token_pool.req_to_token[0, 12].item())
+            // algorithm.page_size
+        )
+        self.assertTrue(algorithm.page_valid[0][physical_page].item())
+        self.assertTrue(algorithm.page_valid[1][physical_page].item())
+
+        sparse_batch = self._make_decode_batch([17])
+        algorithm.begin_forward(
+            sparse_batch,
+            sparse_batch.req_pool_indices,
+            torch.ones(1, dtype=torch.bool),
+            self.device,
+        )
+        selected_pages, valid_lengths = algorithm.retrieve_topk(
+            torch.ones((1, 1, 2)),
+            0,
+            sparse_batch.req_pool_indices,
+            torch.ones(1, dtype=torch.bool),
+            forward_batch=sparse_batch,
+        )
+
+        self.assertGreater(valid_lengths.item(), 0)
+        self.assertTrue((selected_pages[0, : valid_lengths.item()] == 3).any().item())
+
     def _run_decode_forward(
         self, algorithm, forward_batch, *, fixed_capacity=False, finalize=True
     ):

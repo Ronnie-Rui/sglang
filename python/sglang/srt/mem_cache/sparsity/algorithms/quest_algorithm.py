@@ -129,6 +129,19 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             )
         self._prepare_decode_selection_cache(forward_batch, fixed_capacity)
 
+    def begin_dense_forward(self, forward_batch) -> None:
+        # A dense decode step must not leave selection or lazy-update state
+        # available to a later sparse step in a differently shaped batch.
+        self._selection_cache = None
+        self._selection_cache_group = None
+        self._selection_cache_layer = None
+        self._actual_selection_anchors.clear()
+        self._metadata_length_updates.clear()
+        self._last_metadata_layer = None
+        self._invalidate_decode_selection_cache()
+        self._lazy_page_update_active = False
+        super().begin_dense_forward(forward_batch)
+
     @staticmethod
     def _host_int_tuple(value, expected_size: int) -> tuple[int, ...] | None:
         if torch.is_tensor(value):

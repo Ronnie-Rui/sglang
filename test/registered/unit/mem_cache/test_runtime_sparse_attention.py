@@ -801,6 +801,290 @@ class _RecordingAlgorithm(BaseSparseAlgorithmImpl):
         raise NotImplementedError
 
 
+class TestDenseFallbackDispatch(unittest.TestCase):
+    @staticmethod
+    def _make_forward_batch(seq_lens_cpu):
+        batch_size = len(seq_lens_cpu) if seq_lens_cpu is not None else 2
+        seq_lens = (
+            torch.tensor(seq_lens_cpu, dtype=torch.int64)
+            if seq_lens_cpu is not None
+            else torch.tensor([8, 8], dtype=torch.int64)
+        )
+        return SimpleNamespace(
+            forward_mode=_ForwardMode(decode=True),
+            seq_lens=seq_lens,
+            seq_lens_cpu=(
+                torch.tensor(seq_lens_cpu, dtype=torch.int64)
+                if seq_lens_cpu is not None
+                else None
+            ),
+            req_pool_indices=torch.arange(batch_size, dtype=torch.int64),
+            runtime_sparse_page_capacity=None,
+            spec_info=None,
+        )
+
+    @staticmethod
+    def _make_coordinator(threshold=8):
+        coordinator = object.__new__(SparseCoordinator)
+        coordinator.config = SimpleNamespace(
+            min_sparse_prompt_len=0,
+            sparse_extra_config={"dense_fallback_max_seq_len": threshold},
+        )
+        coordinator.device = torch.device("cpu")
+        return coordinator
+
+    def test_eager_whole_batch_gate_is_inclusive_and_requires_all_short(self):
+        coordinator = self._make_coordinator()
+        with patch(
+            "sglang.srt.model_executor.runner_backend_utils."
+            "breakable_cuda_graph.is_in_breakable_cuda_graph",
+            return_value=False,
+        ):
+            self.assertTrue(
+                coordinator._should_use_dense_fallback(
+                    self._make_forward_batch([8, 7]), fixed_capacity=False
+                )
+            )
+            self.assertFalse(
+                coordinator._should_use_dense_fallback(
+                    self._make_forward_batch([8, 9]), fixed_capacity=False
+                )
+            )
+
+    def test_gate_falls_back_to_quest_when_runtime_identity_is_not_safe(self):
+        coordinator = self._make_coordinator()
+        cases = (
+            ("disabled", self._make_forward_batch([8, 8]), False, 0),
+            ("missing_host_lengths", self._make_forward_batch(None), False, 8),
+            ("fixed_capacity_bool", self._make_forward_batch([8, 8]), True, 8),
+            ("fixed_capacity_bucket", self._make_forward_batch([8, 8]), 64, 8),
+        )
+        with patch(
+            "sglang.srt.model_executor.runner_backend_utils."
+            "breakable_cuda_graph.is_in_breakable_cuda_graph",
+            return_value=False,
+        ):
+            for name, forward_batch, fixed_capacity, threshold in cases:
+                with self.subTest(name=name):
+                    coordinator.config.sparse_extra_config[
+                        "dense_fallback_max_seq_len"
+                    ] = threshold
+                    self.assertFalse(
+                        coordinator._should_use_dense_fallback(
+                            forward_batch, fixed_capacity=fixed_capacity
+                        )
+                    )
+
+            coordinator.config.sparse_extra_config["dense_fallback_max_seq_len"] = 8
+            graph_batch = self._make_forward_batch([8, 8])
+            graph_batch.runtime_sparse_page_capacity = 64
+            self.assertFalse(
+                coordinator._should_use_dense_fallback(
+                    graph_batch, fixed_capacity=False
+                )
+            )
+
+    def test_cuda_graph_context_gates_keep_quest_retrieval(self):
+        coordinator = self._make_coordinator()
+        contexts = (
+            ("breakable", True, False, None),
+            ("tc_piecewise_capture", False, True, None),
+            ("tc_piecewise_forward", False, False, object()),
+        )
+        for name, breakable, tc_piecewise, forward_context in contexts:
+            with self.subTest(name=name), patch(
+                "sglang.srt.model_executor.runner_backend_utils."
+                "breakable_cuda_graph.is_in_breakable_cuda_graph",
+                return_value=breakable,
+            ), patch(
+                "sglang.srt.model_executor.runner_backend_utils."
+                "tc_piecewise_cuda_graph.is_in_tc_piecewise_cuda_graph",
+                return_value=tc_piecewise,
+            ), patch(
+                "sglang.srt.model_executor.runner_backend_utils."
+                "tc_piecewise_cuda_graph.get_tc_piecewise_forward_context",
+                return_value=forward_context,
+            ):
+                self.assertFalse(
+                    coordinator._should_use_dense_fallback(
+                        self._make_forward_batch([8, 8]), fixed_capacity=False
+                    )
+                )
+
+    def test_dense_lifecycle_updates_representations_before_crossing_threshold(self):
+        coordinator = self._make_coordinator()
+        algorithm = SimpleNamespace(
+            begin_dense_forward=Mock(),
+            begin_forward=Mock(),
+            should_update_representations=Mock(return_value=True),
+            construct_representations=Mock(),
+            update_representations=Mock(),
+            finalize_forward=Mock(),
+        )
+        coordinator.algorithm = algorithm
+        coordinator.backend_adaptor = SimpleNamespace(
+            save_original_metadata=Mock(),
+        )
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(32, dtype=torch.int64).view(2, 16)
+        )
+        coordinator.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=Mock(return_value=torch.empty(1))
+        )
+        coordinator.states = SimpleNamespace(
+            repr_constructed=torch.tensor([True, True]),
+            prompt_lens=torch.tensor([8, 8], dtype=torch.int64),
+        )
+        coordinator.page_size = 4
+        coordinator._forward_sparse_mask = None
+        coordinator._forward_dense_fallback = False
+        coordinator._last_sparse_layer_id = None
+        coordinator._forward_started = False
+        metadata = object()
+        layer = SimpleNamespace(layer_id=0)
+        short_batch = self._make_forward_batch([8, 8])
+
+        with patch(
+            "sglang.srt.model_executor.runner_backend_utils."
+            "breakable_cuda_graph.is_in_breakable_cuda_graph",
+            return_value=False,
+        ), patch.object(
+            coordinator, "_handle_sparse_retrieve", return_value="sparse"
+        ) as sparse_retrieve:
+            self.assertIs(
+                coordinator.attention_begin(
+                    torch.empty(2, 1),
+                    torch.empty(2, 1),
+                    torch.empty(2, 1),
+                    layer,
+                    short_batch,
+                    metadata,
+                ),
+                metadata,
+            )
+            algorithm.begin_dense_forward.assert_called_once_with(short_batch)
+            algorithm.begin_forward.assert_not_called()
+            coordinator.backend_adaptor.save_original_metadata.assert_not_called()
+            sparse_retrieve.assert_not_called()
+
+            coordinator.attention_end(torch.empty(2, 1), layer, short_batch)
+            algorithm.construct_representations.assert_not_called()
+            algorithm.update_representations.assert_called_once()
+            coordinator.token_to_kv_pool.get_key_buffer.assert_called_once_with(0)
+            coordinator.finalize_forward(short_batch)
+            algorithm.finalize_forward.assert_called_once_with(short_batch)
+
+            long_batch = self._make_forward_batch([9, 8])
+            self.assertEqual(
+                coordinator.attention_begin(
+                    torch.empty(2, 1),
+                    torch.empty(2, 1),
+                    torch.empty(2, 1),
+                    layer,
+                    long_batch,
+                    metadata,
+                ),
+                "sparse",
+            )
+            algorithm.begin_forward.assert_called_once()
+            coordinator.backend_adaptor.save_original_metadata.assert_called_once_with(
+                metadata
+            )
+            sparse_retrieve.assert_called_once()
+
+    def test_sparse_dense_sparse_transition_does_not_restore_stale_metadata(self):
+        coordinator = self._make_coordinator()
+        selected_pages = torch.tensor([[1]], dtype=torch.int32)
+        valid_lengths = torch.tensor([1], dtype=torch.int32)
+        algorithm = SimpleNamespace(
+            begin_dense_forward=Mock(),
+            begin_forward=Mock(),
+            should_update_metadata_lengths=Mock(return_value=True),
+            retrieve_topk=Mock(return_value=(selected_pages, valid_lengths)),
+            get_selected_physical_pages=Mock(return_value=None),
+            finalize_forward=Mock(),
+        )
+        adaptor = FlashAttentionAdaptor(torch.device("cpu"))
+        coordinator.algorithm = algorithm
+        coordinator.backend_adaptor = adaptor
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(16, dtype=torch.int64).view(1, 16)
+        )
+        coordinator.states = SimpleNamespace(
+            repr_constructed=torch.tensor([True]),
+            prompt_lens=torch.tensor([9], dtype=torch.int64),
+        )
+        coordinator.page_size = 4
+        coordinator._forward_sparse_mask = None
+        coordinator._forward_dense_fallback = False
+        coordinator._last_sparse_layer_id = None
+        coordinator._forward_started = False
+        layer = SimpleNamespace(layer_id=0)
+        query = torch.empty(1, 1)
+        metadata = SimpleNamespace(
+            page_table=torch.zeros((1, 4), dtype=torch.int32),
+            cache_seqlens_int32=torch.zeros(1, dtype=torch.int32),
+            cu_seqlens_k=torch.zeros(2, dtype=torch.int32),
+            max_seq_len_k=0,
+            scheduler_metadata=None,
+        )
+
+        def reset_dense_metadata(seq_len):
+            metadata.page_table.copy_(torch.tensor([[0, 1, 2, 3]], dtype=torch.int32))
+            metadata.cache_seqlens_int32.fill_(seq_len)
+            metadata.cu_seqlens_k.copy_(torch.tensor([0, seq_len], dtype=torch.int32))
+            metadata.max_seq_len_k = seq_len
+            metadata.scheduler_metadata = torch.ones(1, dtype=torch.int32)
+
+        with patch(
+            "sglang.srt.model_executor.runner_backend_utils."
+            "breakable_cuda_graph.is_in_breakable_cuda_graph",
+            return_value=False,
+        ), patch.object(
+            adaptor, "save_original_metadata", wraps=adaptor.save_original_metadata
+        ) as save_metadata, patch.object(
+            adaptor,
+            "adapt_for_attn_metadata",
+            wraps=adaptor.adapt_for_attn_metadata,
+        ) as adapt_metadata:
+            long_batch = self._make_forward_batch([9])
+            reset_dense_metadata(9)
+            coordinator.attention_begin(
+                query, query, query, layer, long_batch, metadata
+            )
+            self.assertEqual(metadata.cache_seqlens_int32.tolist(), [1])
+            coordinator.finalize_forward(long_batch)
+
+            short_batch = self._make_forward_batch([8])
+            reset_dense_metadata(8)
+            dense_snapshot = (
+                metadata.page_table.clone(),
+                metadata.cache_seqlens_int32.clone(),
+                metadata.cu_seqlens_k.clone(),
+                metadata.scheduler_metadata,
+            )
+            coordinator.attention_begin(
+                query, query, query, layer, short_batch, metadata
+            )
+            torch.testing.assert_close(metadata.page_table, dense_snapshot[0])
+            torch.testing.assert_close(metadata.cache_seqlens_int32, dense_snapshot[1])
+            torch.testing.assert_close(metadata.cu_seqlens_k, dense_snapshot[2])
+            self.assertIs(metadata.scheduler_metadata, dense_snapshot[3])
+            self.assertEqual(save_metadata.call_count, 1)
+            self.assertEqual(adapt_metadata.call_count, 1)
+            coordinator.finalize_forward(short_batch)
+
+            reset_dense_metadata(9)
+            coordinator.attention_begin(
+                query, query, query, layer, long_batch, metadata
+            )
+
+        self.assertEqual(save_metadata.call_count, 2)
+        self.assertEqual(adapt_metadata.call_count, 2)
+        self.assertEqual(algorithm.retrieve_topk.call_count, 2)
+        algorithm.begin_dense_forward.assert_called_once_with(short_batch)
+
+
 class TestSparseRepresentationLifecycle(unittest.TestCase):
     def test_extend_resets_slot_and_decode_updates_only_at_page_boundary(self):
         algorithm = _RecordingAlgorithm()
