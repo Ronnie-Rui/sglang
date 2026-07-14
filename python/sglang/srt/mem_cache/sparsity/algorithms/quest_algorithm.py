@@ -8,10 +8,12 @@ materializing full dot products.
 """
 
 import logging
+from dataclasses import dataclass
 
 import torch
 
 from sglang.srt.arg_groups.hisparse_hook import (
+    QUEST_DECODE_TOKEN_SELECTION_REUSE_INTERVAL_OPTION,
     QUEST_MAX_SELECTED_TOKENS_OPTION,
     QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION,
     resolve_quest_page_bounds_dtype,
@@ -21,6 +23,15 @@ from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _DecodeSelectionCacheState:
+    request_signature: tuple
+    sequence_lengths: tuple[int, ...]
+    page_counts: tuple[int, ...]
+    selections: dict[tuple[int, float], tuple[torch.Tensor, torch.Tensor]]
+    age: int
 
 
 class QuestAlgorithm(BaseSparseAlgorithmImpl):
@@ -66,6 +77,9 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.layer_selection_reuse_interval = config.sparse_extra_config.get(
             "layer_selection_reuse_interval", 1
         )
+        self.decode_token_selection_reuse_interval = config.sparse_extra_config.get(
+            QUEST_DECODE_TOKEN_SELECTION_REUSE_INTERVAL_OPTION, 1
+        )
         self.layer_page_budget = tuple(
             (
                 budget_range["start_layer"],
@@ -80,6 +94,11 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self._actual_selection_anchors = set()
         self._metadata_length_updates = {}
         self._last_metadata_layer = None
+        self._decode_selection_cache_state = None
+        self._pending_decode_selection_cache_state = None
+        self._decode_selection_cache_mode = None
+        self._decode_selection_cache_touched = False
+        self._decode_selection_graph_bypass_logged = False
         self._lazy_page_update_active = False
         self._lazy_page_update_graph_states = {}
         self.page_k_min = {}
@@ -96,8 +115,10 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self._actual_selection_anchors.clear()
         self._metadata_length_updates.clear()
         self._last_metadata_layer = None
+        self._discard_pending_decode_selection_cache()
         super().begin_forward(*args, **kwargs)
         self._lazy_page_update_active = self._can_enable_lazy_page_update()
+        forward_batch = kwargs.get("forward_batch", args[0] if args else None)
         fixed_capacity = kwargs.get(
             "fixed_capacity", args[4] if len(args) > 4 else False
         )
@@ -106,6 +127,145 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 self._lazy_page_update_active,
                 self._retrieval_plan.max_num_pages,
             )
+        self._prepare_decode_selection_cache(forward_batch, fixed_capacity)
+
+    @staticmethod
+    def _host_int_tuple(value, expected_size: int) -> tuple[int, ...] | None:
+        if torch.is_tensor(value):
+            if value.device.type != "cpu" or value.numel() != expected_size:
+                return None
+            values = value.reshape(-1).tolist()
+        else:
+            try:
+                values = list(value)
+            except TypeError:
+                return None
+            if len(values) != expected_size:
+                return None
+        return tuple(int(item) for item in values)
+
+    def _decode_selection_signatures(self, forward_batch, fixed_capacity):
+        if (
+            self.decode_token_selection_reuse_interval <= 1
+            or forward_batch is None
+            or fixed_capacity is not False
+            or getattr(forward_batch, "spec_info", None) is not None
+            or getattr(forward_batch, "runtime_sparse_page_capacity", None) is not None
+        ):
+            return None
+
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        is_decode = getattr(forward_mode, "is_decode", None)
+        if not callable(is_decode) or not is_decode():
+            return None
+
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            is_in_breakable_cuda_graph,
+        )
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            is_in_tc_piecewise_cuda_graph,
+        )
+
+        if is_in_breakable_cuda_graph() or is_in_tc_piecewise_cuda_graph():
+            if not self._decode_selection_graph_bypass_logged:
+                logger.info(
+                    "Quest decode-token selection reuse is disabled inside CUDA Graph "
+                    "execution."
+                )
+                self._decode_selection_graph_bypass_logged = True
+            return None
+        if (
+            torch.device(self.device).type == "cuda"
+            and torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+
+        plan = self._retrieval_plan
+        if plan is None or plan.fixed_capacity:
+            return None
+        request_slots = self._host_int_tuple(
+            getattr(forward_batch, "req_pool_indices_cpu", None), plan.batch_size
+        )
+        sequence_lengths = self._host_int_tuple(plan.seq_lens_cpu, plan.batch_size)
+        page_counts = self._host_int_tuple(plan.num_pages_cpu, plan.batch_size)
+        rids = getattr(forward_batch, "rids", None)
+        if (
+            request_slots is None
+            or sequence_lengths is None
+            or page_counts is None
+            or not isinstance(rids, (list, tuple))
+            or len(rids) != plan.batch_size
+        ):
+            return None
+        request_ids = tuple(rids)
+        try:
+            hash(request_ids)
+        except TypeError:
+            return None
+        return (request_ids, request_slots), sequence_lengths, page_counts
+
+    def _prepare_decode_selection_cache(self, forward_batch, fixed_capacity) -> None:
+        signatures = self._decode_selection_signatures(forward_batch, fixed_capacity)
+        if signatures is None:
+            self._invalidate_decode_selection_cache()
+            return
+
+        request_signature, sequence_lengths, page_counts = signatures
+        committed = self._decode_selection_cache_state
+        sequential = (
+            committed is not None
+            and len(committed.sequence_lengths) == len(sequence_lengths)
+            and all(
+                current == previous + 1
+                for current, previous in zip(
+                    sequence_lengths, committed.sequence_lengths
+                )
+            )
+        )
+        completed_page = any(
+            seq_len > 0 and seq_len % self.page_size == 0
+            for seq_len in sequence_lengths
+        )
+        can_reuse = (
+            committed is not None
+            and bool(committed.selections)
+            and committed.request_signature == request_signature
+            and committed.page_counts == page_counts
+            and sequential
+            and not completed_page
+            and committed.age < self.decode_token_selection_reuse_interval - 1
+        )
+        self._decode_selection_cache_mode = "reuse" if can_reuse else "refresh"
+        self._decode_selection_cache_touched = False
+        self._pending_decode_selection_cache_state = _DecodeSelectionCacheState(
+            request_signature=request_signature,
+            sequence_lengths=sequence_lengths,
+            page_counts=page_counts,
+            selections=(dict(committed.selections) if can_reuse else {}),
+            age=committed.age + 1 if can_reuse else 0,
+        )
+
+    def _discard_pending_decode_selection_cache(self) -> None:
+        self._pending_decode_selection_cache_state = None
+        self._decode_selection_cache_mode = None
+        self._decode_selection_cache_touched = False
+
+    def _invalidate_decode_selection_cache(self) -> None:
+        self._decode_selection_cache_state = None
+        self._discard_pending_decode_selection_cache()
+
+    def _commit_pending_decode_selection_cache(self) -> None:
+        pending = self._pending_decode_selection_cache_state
+        if (
+            pending is not None
+            and self._decode_selection_cache_touched
+            and pending.selections
+        ):
+            self._decode_selection_cache_state = pending
+        else:
+            self._decode_selection_cache_state = None
+        self._discard_pending_decode_selection_cache()
 
     def _get_lazy_page_update_state(self, forward_batch=None) -> tuple[bool, int]:
         capacity = getattr(forward_batch, "runtime_sparse_page_capacity", None)
@@ -250,6 +410,38 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             # it prepared avoids remapping or rewriting the same pages.
             return selected_indices, valid_lengths, True
 
+        pending = self._pending_decode_selection_cache_state
+        cached_selection = (
+            pending.selections.get(group)
+            if pending is not None
+            and self._decode_selection_cache_mode == "reuse"
+            and self._is_selection_anchor(layer_id)
+            and layer_order_is_contiguous
+            else None
+        )
+        if cached_selection is not None:
+            self._actual_selection_anchors.add(layer_id)
+            self._decode_selection_cache_touched = True
+            self._selection_cache = cached_selection
+            self._selection_cache_group = group
+            self._selection_cache_layer = layer_id
+            selected_physical_pages, valid_lengths = cached_selection
+            # Cross-token hits must rebuild metadata for the current token.
+            # The explicit physical-pages field prevents a second logical map.
+            return (
+                selected_physical_pages,
+                valid_lengths,
+                False,
+                selected_physical_pages,
+            )
+
+        if pending is not None and self._decode_selection_cache_mode == "reuse":
+            # A previously unseen/non-static group makes the remainder of this
+            # forward a refresh. Publish only newly owned results at finalize.
+            pending.selections.clear()
+            pending.age = 0
+            self._decode_selection_cache_mode = "refresh"
+
         self._actual_selection_anchors.add(layer_id)
         result = super().retrieve_topk(
             queries,
@@ -261,7 +453,40 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self._selection_cache = result[:2]
         self._selection_cache_group = group
         self._selection_cache_layer = layer_id
+        pending = self._pending_decode_selection_cache_state
+        if pending is not None:
+            metadata_prepared = len(result) >= 3 and bool(result[2])
+            if metadata_prepared:
+                selected_physical_pages = result[0].detach().clone()
+            else:
+                selected_physical_pages = self.get_selected_physical_pages(result[0])
+                if selected_physical_pages is not None:
+                    selected_physical_pages = selected_physical_pages.detach().clone()
+            if selected_physical_pages is not None:
+                pending.selections[group] = (
+                    selected_physical_pages,
+                    result[1].detach().clone(),
+                )
+                self._decode_selection_cache_touched = True
         return result
+
+    def construct_representations(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_buffer: torch.Tensor,
+        forward_batch,
+    ) -> None:
+        if forward_batch.forward_mode.is_extend():
+            self._invalidate_decode_selection_cache()
+        return super().construct_representations(
+            layer_id,
+            req_pool_indices,
+            seq_lens,
+            k_buffer,
+            forward_batch,
+        )
 
     def _can_use_triton_page_update(
         self,
@@ -371,13 +596,27 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
 
     def finalize_forward(self, forward_batch) -> None:
         if not forward_batch.forward_mode.is_decode():
+            self._invalidate_decode_selection_cache()
             return
 
         req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
         seq_lens = getattr(forward_batch, "seq_lens", None)
         if req_pool_indices is None or seq_lens is None:
+            self._discard_pending_decode_selection_cache()
             return
 
+        try:
+            self._finalize_representation_trackers(
+                forward_batch, req_pool_indices, seq_lens
+            )
+        except Exception:
+            self._discard_pending_decode_selection_cache()
+            raise
+        self._commit_pending_decode_selection_cache()
+
+    def _finalize_representation_trackers(
+        self, forward_batch, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+    ) -> None:
         lazy_page_update_active, lazy_max_pages = self._get_lazy_page_update_state(
             forward_batch
         )

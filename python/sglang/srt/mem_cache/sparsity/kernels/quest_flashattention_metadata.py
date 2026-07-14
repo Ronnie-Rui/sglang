@@ -345,6 +345,7 @@ def _quest_update_flashattention_metadata_kernel(
     BATCH_SIZE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     UPDATE_LENGTHS: tl.constexpr,
+    SELECTED_INDICES_ARE_PHYSICAL: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
@@ -357,28 +358,31 @@ def _quest_update_flashattention_metadata_kernel(
     active = use_sparse & (valid_length > 0)
     write_mask = active & (page_offsets < max_selected) & (page_offsets < valid_length)
 
-    logical_pages = tl.load(
+    selected_pages = tl.load(
         selected_indices_ptr
         + batch_idx * selected_indices_stride_b
         + page_offsets * selected_indices_stride_p,
         mask=write_mask,
         other=-1,
     ).to(tl.int64)
-    req_idx = tl.load(
-        req_pool_indices_ptr + batch_idx * req_pool_indices_stride_b,
-        mask=active,
-        other=0,
-    ).to(tl.int64)
-    nonnegative_page = logical_pages >= 0
-    token_offsets = tl.maximum(logical_pages, 0) * PAGE_SIZE
-    first_tokens = tl.load(
-        req_to_token_ptr
-        + req_idx * req_to_token_stride_b
-        + token_offsets * req_to_token_stride_t,
-        mask=write_mask & nonnegative_page,
-        other=0,
-    ).to(tl.int64)
-    physical_pages = tl.where(nonnegative_page, first_tokens // PAGE_SIZE, 0)
+    nonnegative_page = selected_pages >= 0
+    if SELECTED_INDICES_ARE_PHYSICAL:
+        physical_pages = tl.where(nonnegative_page, selected_pages, 0)
+    else:
+        req_idx = tl.load(
+            req_pool_indices_ptr + batch_idx * req_pool_indices_stride_b,
+            mask=active,
+            other=0,
+        ).to(tl.int64)
+        token_offsets = tl.maximum(selected_pages, 0) * PAGE_SIZE
+        first_tokens = tl.load(
+            req_to_token_ptr
+            + req_idx * req_to_token_stride_b
+            + token_offsets * req_to_token_stride_t,
+            mask=write_mask & nonnegative_page,
+            other=0,
+        ).to(tl.int64)
+        physical_pages = tl.where(nonnegative_page, first_tokens // PAGE_SIZE, 0)
     tl.store(
         page_table_ptr
         + batch_idx * page_table_stride_b
@@ -431,8 +435,9 @@ def quest_update_flashattention_metadata_(
     page_size: int,
     *,
     update_lengths: bool,
+    selected_indices_are_physical: bool = False,
 ) -> None:
-    """Map Quest pages and update fixed-address FA metadata in place."""
+    """Update fixed-address FA metadata from logical or physical Quest pages."""
     if not selected_indices.is_cuda:
         raise ValueError("Quest FlashAttention metadata kernel requires CUDA tensors")
     if selected_indices.ndim != 2:
@@ -518,6 +523,7 @@ def quest_update_flashattention_metadata_(
         BATCH_SIZE=batch_size,
         PAGE_SIZE=page_size,
         UPDATE_LENGTHS=update_lengths,
+        SELECTED_INDICES_ARE_PHYSICAL=selected_indices_are_physical,
         BLOCK_PAGES=block_pages,
         num_warps=4,
     )

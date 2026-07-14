@@ -837,6 +837,285 @@ class TestQuestFixedSelectionBudget(CustomTestCase):
         )
 
 
+class TestQuestDecodeTokenSelectionReuse(unittest.TestCase):
+    device = torch.device("cpu")
+
+    @staticmethod
+    def _make_reuse_algorithm(interval=None, *, pool_size=2):
+        sparse_extra_config = {"layer_selection_reuse_interval": 1}
+        if interval is not None:
+            sparse_extra_config["decode_token_selection_reuse_interval"] = interval
+        algorithm, _ = _make_algorithm(
+            batch_size=pool_size,
+            seq_lens=torch.full((pool_size,), 64, dtype=torch.int64),
+            page_size=8,
+            sparsity_ratio=0.5,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=1,
+            device=torch.device("cpu"),
+            seed=0,
+            sparse_extra_config=sparse_extra_config,
+        )
+        return algorithm
+
+    @staticmethod
+    def _make_decode_batch(seq_lens, *, rids=None, req_slots=None):
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int64)
+        batch_size = seq_lens.numel()
+        if rids is None:
+            rids = [f"request-{index}" for index in range(batch_size)]
+        if req_slots is None:
+            req_slots = list(range(batch_size))
+        req_pool_indices = torch.tensor(req_slots, dtype=torch.int64)
+        return SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: True,
+                is_extend=lambda: False,
+            ),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.clone(),
+            req_pool_indices=req_pool_indices,
+            req_pool_indices_cpu=req_pool_indices.clone(),
+            rids=list(rids),
+        )
+
+    @staticmethod
+    def _fake_underlying_retrieve(queries, *args, **kwargs):
+        batch_size = queries.shape[0]
+        return (
+            torch.zeros((batch_size, 1), dtype=torch.int32),
+            torch.ones(batch_size, dtype=torch.int32),
+        )
+
+    def _run_decode_forward(
+        self, algorithm, forward_batch, *, fixed_capacity=False, finalize=True
+    ):
+        batch_size = forward_batch.seq_lens.numel()
+        sparse_mask = torch.ones(batch_size, dtype=torch.bool)
+        algorithm.begin_forward(
+            forward_batch,
+            forward_batch.req_pool_indices,
+            sparse_mask,
+            self.device,
+            fixed_capacity=fixed_capacity,
+        )
+        result = algorithm.retrieve_topk(
+            torch.zeros((batch_size, 1, 1)),
+            0,
+            forward_batch.req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )
+        if finalize:
+            algorithm.finalize_forward(forward_batch)
+        return result
+
+    def test_default_and_explicit_one_refresh_every_decode_token(self):
+        for interval in (None, 1):
+            with self.subTest(interval=interval):
+                algorithm = self._make_reuse_algorithm(interval)
+                with (
+                    patch.object(
+                        BaseSparseAlgorithmImpl,
+                        "retrieve_topk",
+                        side_effect=self._fake_underlying_retrieve,
+                    ) as underlying_retrieve,
+                    patch.object(algorithm, "_finalize_representation_trackers"),
+                ):
+                    first = self._run_decode_forward(
+                        algorithm, self._make_decode_batch([17])
+                    )
+                    second = self._run_decode_forward(
+                        algorithm, self._make_decode_batch([18])
+                    )
+
+                self.assertEqual(underlying_retrieve.call_count, 2)
+                self.assertEqual(len(first), 2)
+                self.assertEqual(len(second), 2)
+                self.assertIsNone(algorithm._decode_selection_cache_state)
+
+    def test_interval_three_refreshes_then_reuses_twice(self):
+        algorithm = self._make_reuse_algorithm(3)
+        batches = [
+            self._make_decode_batch([seq_len], req_slots=[1])
+            for seq_len in (17, 18, 19, 20)
+        ]
+
+        with (
+            patch.object(
+                BaseSparseAlgorithmImpl,
+                "retrieve_topk",
+                side_effect=self._fake_underlying_retrieve,
+            ) as underlying_retrieve,
+            patch.object(algorithm, "_finalize_representation_trackers"),
+        ):
+            results = [self._run_decode_forward(algorithm, batch) for batch in batches]
+
+        self.assertEqual(underlying_retrieve.call_count, 2)
+        self.assertEqual([len(result) for result in results], [2, 4, 4, 2])
+        # Request-pool slot 1 starts at physical page 8. Cross-token hits
+        # return that owned physical page and identify it explicitly as such.
+        for result in results[1:3]:
+            self.assertEqual(result[0].tolist(), [[8]])
+            self.assertIs(result[0], result[3])
+            self.assertFalse(result[2])
+        self.assertEqual(algorithm._decode_selection_cache_state.age, 0)
+
+    def test_request_sequence_and_page_changes_force_refresh(self):
+        cases = (
+            (
+                "request reorder",
+                ([17, 17], ["a", "b"], [0, 1]),
+                ([18, 18], ["b", "a"], [0, 1]),
+            ),
+            (
+                "request slot reorder",
+                ([17, 17], ["a", "b"], [0, 1]),
+                ([18, 18], ["a", "b"], [1, 0]),
+            ),
+            (
+                "batch churn",
+                ([17, 17], ["a", "b"], [0, 1]),
+                ([18], ["a"], [0]),
+            ),
+            (
+                "sequence jump",
+                ([17], ["a"], [0]),
+                ([19], ["a"], [0]),
+            ),
+            (
+                "sequence rollback",
+                ([18], ["a"], [0]),
+                ([17], ["a"], [0]),
+            ),
+            (
+                "completed page",
+                ([15], ["a"], [0]),
+                ([16], ["a"], [0]),
+            ),
+            (
+                "page count change",
+                ([16], ["a"], [0]),
+                ([17], ["a"], [0]),
+            ),
+        )
+
+        for name, previous, current in cases:
+            with self.subTest(name=name):
+                algorithm = self._make_reuse_algorithm(8)
+                previous_batch = self._make_decode_batch(
+                    previous[0], rids=previous[1], req_slots=previous[2]
+                )
+                current_batch = self._make_decode_batch(
+                    current[0], rids=current[1], req_slots=current[2]
+                )
+                with (
+                    patch.object(
+                        BaseSparseAlgorithmImpl,
+                        "retrieve_topk",
+                        side_effect=self._fake_underlying_retrieve,
+                    ) as underlying_retrieve,
+                    patch.object(algorithm, "_finalize_representation_trackers"),
+                ):
+                    self._run_decode_forward(algorithm, previous_batch)
+                    result = self._run_decode_forward(algorithm, current_batch)
+
+                self.assertEqual(underlying_retrieve.call_count, 2)
+                self.assertEqual(len(result), 2)
+                self.assertEqual(algorithm._decode_selection_cache_state.age, 0)
+
+    def test_missing_host_identity_or_lengths_disables_reuse(self):
+        for missing_attribute in ("req_pool_indices_cpu", "seq_lens_cpu"):
+            with self.subTest(missing_attribute=missing_attribute):
+                algorithm = self._make_reuse_algorithm(8)
+                first_batch = self._make_decode_batch([17])
+                second_batch = self._make_decode_batch([18])
+                setattr(second_batch, missing_attribute, None)
+                with (
+                    patch.object(
+                        BaseSparseAlgorithmImpl,
+                        "retrieve_topk",
+                        side_effect=self._fake_underlying_retrieve,
+                    ) as underlying_retrieve,
+                    patch.object(algorithm, "_finalize_representation_trackers"),
+                ):
+                    self._run_decode_forward(algorithm, first_batch)
+                    result = self._run_decode_forward(algorithm, second_batch)
+
+                self.assertEqual(underlying_retrieve.call_count, 2)
+                self.assertEqual(len(result), 2)
+                self.assertIsNone(algorithm._decode_selection_cache_state)
+
+    def test_pending_cache_commits_only_after_successful_finalize(self):
+        algorithm = self._make_reuse_algorithm(3)
+        forward_batch = self._make_decode_batch([17])
+        with (
+            patch.object(
+                BaseSparseAlgorithmImpl,
+                "retrieve_topk",
+                side_effect=self._fake_underlying_retrieve,
+            ),
+            patch.object(algorithm, "_finalize_representation_trackers"),
+        ):
+            self._run_decode_forward(algorithm, forward_batch, finalize=False)
+            self.assertIsNone(algorithm._decode_selection_cache_state)
+            self.assertIsNotNone(algorithm._pending_decode_selection_cache_state)
+            algorithm.finalize_forward(forward_batch)
+
+        self.assertIsNotNone(algorithm._decode_selection_cache_state)
+        self.assertIsNone(algorithm._pending_decode_selection_cache_state)
+
+        failed_algorithm = self._make_reuse_algorithm(3)
+        failed_batch = self._make_decode_batch([17])
+        with (
+            patch.object(
+                BaseSparseAlgorithmImpl,
+                "retrieve_topk",
+                side_effect=self._fake_underlying_retrieve,
+            ),
+            patch.object(
+                failed_algorithm,
+                "_finalize_representation_trackers",
+                side_effect=RuntimeError("finalize failed"),
+            ),
+        ):
+            self._run_decode_forward(failed_algorithm, failed_batch, finalize=False)
+            with self.assertRaisesRegex(RuntimeError, "finalize failed"):
+                failed_algorithm.finalize_forward(failed_batch)
+
+        self.assertIsNone(failed_algorithm._decode_selection_cache_state)
+        self.assertIsNone(failed_algorithm._pending_decode_selection_cache_state)
+
+    def test_fixed_capacity_forwards_never_reuse_cross_token_selection(self):
+        for fixed_capacity in (True, 4):
+            with self.subTest(fixed_capacity=fixed_capacity):
+                algorithm = self._make_reuse_algorithm(8)
+                with (
+                    patch.object(
+                        BaseSparseAlgorithmImpl,
+                        "retrieve_topk",
+                        side_effect=self._fake_underlying_retrieve,
+                    ) as underlying_retrieve,
+                    patch.object(algorithm, "_finalize_representation_trackers"),
+                ):
+                    first = self._run_decode_forward(
+                        algorithm,
+                        self._make_decode_batch([17]),
+                        fixed_capacity=fixed_capacity,
+                    )
+                    second = self._run_decode_forward(
+                        algorithm,
+                        self._make_decode_batch([18]),
+                        fixed_capacity=fixed_capacity,
+                    )
+
+                self.assertEqual(underlying_retrieve.call_count, 2)
+                self.assertEqual(len(first), 2)
+                self.assertEqual(len(second), 2)
+                self.assertIsNone(algorithm._decode_selection_cache_state)
+
+
 class TestQuestLayerReuseAndBudget(unittest.TestCase):
     device = torch.device("cpu")
 

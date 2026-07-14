@@ -5,6 +5,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
+from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
+    FlashAttentionAdaptor,
+)
+from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import SparseCoordinator
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
@@ -46,10 +50,18 @@ class _States:
 
 
 class _ForwardBatch:
-    def __init__(self, seq_lens, req_pool_indices):
+    def __init__(self, seq_lens, req_pool_indices, *, rids=None):
         self.seq_lens = seq_lens
         self.seq_lens_cpu = seq_lens.cpu()
         self.req_pool_indices = req_pool_indices
+        self.req_pool_indices_cpu = req_pool_indices.cpu()
+        self.rids = list(
+            rids
+            if rids is not None
+            else [f"request-{slot}" for slot in self.req_pool_indices_cpu.tolist()]
+        )
+        self.spec_info = None
+        self.runtime_sparse_page_capacity = None
         self.forward_mode = SimpleNamespace(is_decode=lambda: True)
 
 
@@ -108,6 +120,8 @@ def _make_metadata(batch_size, width, device):
         cu_seqlens_k=torch.full(
             (batch_size + 1,), -99, dtype=torch.int32, device=device
         ),
+        max_seq_len_k=0,
+        scheduler_metadata=None,
     )
 
 
@@ -406,6 +420,273 @@ class TestQuestAllFourIntegration(unittest.TestCase):
             atol=0,
         )
 
+    def test_eager_all_four_reuses_owned_physical_selection_on_next_token(self):
+        from sglang.jit_kernel.quest.topk import (
+            quest_topk_to_flashattention_metadata_out,
+        )
+        from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
+            quest_update_flashattention_metadata_,
+        )
+        from sglang.srt.mem_cache.sparsity.kernels.quest_score import (
+            quest_lazy_update_page_scores,
+        )
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        page_size = 4
+        token0_seq_lens = torch.tensor([193, 169, 145], device=device)
+        token1_seq_lens = token0_seq_lens + 1
+        req_to_token, key_buffer = _build_storage(
+            token0_seq_lens,
+            page_size,
+            device,
+            seed=1429,
+            dtype=torch.float16,
+        )
+        algorithm = _make_algorithm(
+            seq_lens=token0_seq_lens,
+            page_size=page_size,
+            sparsity_ratio=0.4,
+            num_recent_pages=2,
+            req_to_token=req_to_token,
+            key_buffer=key_buffer,
+            extra_config={
+                **_all_four_config(use_native_page_bounds_dtype=True),
+                "decode_token_selection_reuse_interval": 2,
+                "quest_max_selected_tokens": 96,
+            },
+        )
+        req_pool_indices = torch.arange(3, dtype=torch.int64, device=device)
+        sparse_mask = torch.tensor([True, False, True], device=device)
+        rids = ["request-a", "request-b", "request-c"]
+        token0_batch = _ForwardBatch(token0_seq_lens, req_pool_indices, rids=rids)
+        token1_batch = _ForwardBatch(token1_seq_lens, req_pool_indices, rids=rids)
+
+        max_pages = int(((token1_seq_lens.max() + page_size - 1) // page_size).item())
+        metadata = _make_metadata(3, max_pages, device)
+        metadata_ptrs = (
+            metadata.page_table.data_ptr(),
+            metadata.cache_seqlens_int32.data_ptr(),
+            metadata.cu_seqlens_k.data_ptr(),
+        )
+
+        def reset_dense_metadata(forward_batch):
+            page_starts = (
+                torch.arange(max_pages, dtype=torch.int64, device=device) * page_size
+            )
+            dense_pages = torch.div(
+                req_to_token[
+                    req_pool_indices.unsqueeze(1),
+                    page_starts.unsqueeze(0),
+                ],
+                page_size,
+                rounding_mode="floor",
+            ).to(torch.int32)
+            metadata.page_table.copy_(dense_pages)
+            metadata.cache_seqlens_int32.copy_(forward_batch.seq_lens.to(torch.int32))
+            metadata.cu_seqlens_k[0].zero_()
+            metadata.cu_seqlens_k[1:].copy_(
+                forward_batch.seq_lens.cumsum(0, dtype=torch.int32)
+            )
+            metadata.max_seq_len_k = int(forward_batch.seq_lens_cpu.max().item())
+            metadata.scheduler_metadata = None
+
+        adaptor = FlashAttentionAdaptor(device)
+        coordinator = object.__new__(SparseCoordinator)
+        coordinator.algorithm = algorithm
+        coordinator.backend_adaptor = adaptor
+        coordinator.req_to_token_pool = algorithm.req_to_token_pool
+        coordinator.page_size = page_size
+        coordinator._forward_sparse_mask = sparse_mask
+
+        generator = torch.Generator(device=device).manual_seed(1543)
+        token0_queries = [
+            torch.randn(
+                3, 1, 8, device=device, dtype=torch.float32, generator=generator
+            )
+            for _ in range(_END_LAYER)
+        ]
+        token1_queries = [
+            torch.randn(
+                3, 1, 8, device=device, dtype=torch.float32, generator=generator
+            )
+            for _ in range(_END_LAYER)
+        ]
+        layers = [SimpleNamespace(layer_id=layer_id) for layer_id in range(_END_LAYER)]
+        anchors = list(range(0, _END_LAYER, 2))
+
+        with patch(
+            "sglang.srt.mem_cache.sparsity.kernels.quest_score."
+            "quest_lazy_update_page_scores",
+            wraps=quest_lazy_update_page_scores,
+        ) as lazy_score, patch(
+            "sglang.jit_kernel.quest.topk." "quest_topk_to_flashattention_metadata_out",
+            wraps=quest_topk_to_flashattention_metadata_out,
+        ) as fused_topk, patch(
+            "sglang.srt.mem_cache.sparsity.kernels."
+            "quest_flashattention_metadata.quest_update_flashattention_metadata_",
+            wraps=quest_update_flashattention_metadata_,
+        ) as metadata_update, patch.object(
+            adaptor,
+            "adapt_for_attn_metadata",
+            wraps=adaptor.adapt_for_attn_metadata,
+        ) as adapt_metadata:
+            reset_dense_metadata(token0_batch)
+            algorithm.begin_forward(
+                forward_batch=token0_batch,
+                req_pool_indices=req_pool_indices,
+                sparse_mask=sparse_mask,
+                device=device,
+            )
+            self.assertEqual(algorithm._decode_selection_cache_mode, "refresh")
+            adaptor.save_original_metadata(metadata)
+            for layer_id, layer in enumerate(layers):
+                adapted = coordinator._handle_sparse_retrieve(
+                    token0_queries[layer_id], layer, token0_batch, metadata
+                )
+                self.assertIs(adapted, metadata)
+                algorithm.update_representations(
+                    layer_id,
+                    req_pool_indices,
+                    token0_seq_lens,
+                    key_buffer,
+                    token0_batch,
+                )
+            algorithm.finalize_forward(token0_batch)
+            torch.cuda.synchronize()
+
+            self.assertEqual(lazy_score.call_count, len(anchors))
+            self.assertEqual(fused_topk.call_count, len(anchors))
+            self.assertEqual(metadata_update.call_count, 0)
+            committed = algorithm._decode_selection_cache_state
+            self.assertIsNotNone(committed)
+            self.assertEqual(committed.age, 0)
+            self.assertEqual(len(committed.selections), len(anchors))
+
+            cached_ptrs = {}
+            cached_snapshots = {}
+            for group, (physical_pages, valid_lengths) in committed.selections.items():
+                cached_ptrs[group] = (
+                    physical_pages.data_ptr(),
+                    valid_lengths.data_ptr(),
+                )
+                cached_snapshots[group] = (
+                    physical_pages.clone(),
+                    valid_lengths.clone(),
+                )
+                self.assertNotEqual(
+                    physical_pages.untyped_storage().data_ptr(),
+                    metadata.page_table.untyped_storage().data_ptr(),
+                )
+
+            reset_dense_metadata(token1_batch)
+            for group, (physical_pages, valid_lengths) in committed.selections.items():
+                expected_pages, expected_lengths = cached_snapshots[group]
+                torch.testing.assert_close(
+                    physical_pages, expected_pages, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    valid_lengths, expected_lengths, rtol=0, atol=0
+                )
+
+            token1_adapt_start = adapt_metadata.call_count
+            algorithm.begin_forward(
+                forward_batch=token1_batch,
+                req_pool_indices=req_pool_indices,
+                sparse_mask=sparse_mask,
+                device=device,
+            )
+            self.assertEqual(algorithm._decode_selection_cache_mode, "reuse")
+            adaptor.save_original_metadata(metadata)
+            for layer_id, layer in enumerate(layers):
+                adapted = coordinator._handle_sparse_retrieve(
+                    token1_queries[layer_id], layer, token1_batch, metadata
+                )
+                self.assertIs(adapted, metadata)
+                call = adapt_metadata.call_args
+                group = algorithm._selection_group(layer_id)
+                selected_pages = call.kwargs["selected_indices"]
+                valid_lengths = call.kwargs["valid_lengths"]
+                self.assertEqual(selected_pages.data_ptr(), cached_ptrs[group][0])
+                self.assertEqual(valid_lengths.data_ptr(), cached_ptrs[group][1])
+
+                if layer_id in anchors:
+                    self.assertIs(
+                        call.kwargs["selected_physical_indices"], selected_pages
+                    )
+                else:
+                    self.assertIsNone(call.kwargs["selected_physical_indices"])
+                    self.assertTrue(call.kwargs["metadata_prepared"])
+
+                if layer_id == 0:
+                    torch.cuda.synchronize()
+                    for row in sparse_mask.nonzero(as_tuple=False).flatten().tolist():
+                        length = int(valid_lengths[row].item())
+                        torch.testing.assert_close(
+                            metadata.page_table[row, :length],
+                            selected_pages[row, :length].to(torch.int32),
+                            rtol=0,
+                            atol=0,
+                        )
+
+                if layer_id in (0, 4, 24):
+                    expected_cache_seqlens, expected_cu_seqlens = _expected_fa_lengths(
+                        valid_lengths,
+                        sparse_mask,
+                        token1_seq_lens,
+                        page_size,
+                    )
+                    torch.testing.assert_close(
+                        metadata.cache_seqlens_int32,
+                        expected_cache_seqlens,
+                        rtol=0,
+                        atol=0,
+                    )
+                    torch.testing.assert_close(
+                        metadata.cu_seqlens_k,
+                        expected_cu_seqlens,
+                        rtol=0,
+                        atol=0,
+                    )
+
+                algorithm.update_representations(
+                    layer_id,
+                    req_pool_indices,
+                    token1_seq_lens,
+                    key_buffer,
+                    token1_batch,
+                )
+            algorithm.finalize_forward(token1_batch)
+            torch.cuda.synchronize()
+
+        self.assertEqual(adapt_metadata.call_count - token1_adapt_start, _END_LAYER)
+        self.assertEqual(lazy_score.call_count, len(anchors))
+        self.assertEqual(fused_topk.call_count, len(anchors))
+        self.assertEqual(metadata_update.call_count, len(anchors))
+        self.assertTrue(
+            all(
+                call.kwargs["selected_indices_are_physical"]
+                for call in metadata_update.call_args_list
+            )
+        )
+        self.assertEqual(
+            [call.kwargs["update_lengths"] for call in metadata_update.call_args_list],
+            [layer_id in (0, 4, 24) for layer_id in anchors],
+        )
+        self.assertEqual(
+            (
+                metadata.page_table.data_ptr(),
+                metadata.cache_seqlens_int32.data_ptr(),
+                metadata.cu_seqlens_k.data_ptr(),
+            ),
+            metadata_ptrs,
+        )
+        committed = algorithm._decode_selection_cache_state
+        self.assertIsNotNone(committed)
+        self.assertEqual(committed.age, 1)
+        for group, (physical_pages, valid_lengths) in committed.selections.items():
+            self.assertEqual(physical_pages.data_ptr(), cached_ptrs[group][0])
+            self.assertEqual(valid_lengths.data_ptr(), cached_ptrs[group][1])
+
     def test_fixed_capacity_all_four_captures_direct_metadata_fallback(self):
         from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
             quest_finalize_to_flashattention_metadata_,
@@ -427,6 +708,7 @@ class TestQuestAllFourIntegration(unittest.TestCase):
             key_buffer=key_buffer,
             extra_config={
                 **_all_four_config(),
+                "decode_token_selection_reuse_interval": 2,
                 "quest_max_selected_tokens": max_selected_tokens,
             },
         )
@@ -457,6 +739,9 @@ class TestQuestAllFourIntegration(unittest.TestCase):
             )
 
         begin_fixed_forward()
+        self.assertIsNone(algorithm._decode_selection_cache_state)
+        self.assertIsNone(algorithm._pending_decode_selection_cache_state)
+        self.assertIsNone(algorithm._decode_selection_cache_mode)
         plan = algorithm._retrieval_plan
         self.assertTrue(plan.fixed_capacity)
         full_width = plan.max_k + algorithm.num_recent_pages
@@ -528,6 +813,7 @@ class TestQuestAllFourIntegration(unittest.TestCase):
         self.assertFalse(algorithm.states.last_constructed_page.any().item())
         algorithm.finalize_forward(forward_batch)
         torch.cuda.synchronize()
+        self.assertIsNone(algorithm._decode_selection_cache_state)
         torch.testing.assert_close(
             algorithm.states.last_constructed_page,
             (seq_lens - 1) // page_size,
@@ -549,6 +835,9 @@ class TestQuestAllFourIntegration(unittest.TestCase):
         metadata.cu_seqlens_k.fill_(-99)
 
         begin_fixed_forward()
+        self.assertIsNone(algorithm._decode_selection_cache_state)
+        self.assertIsNone(algorithm._pending_decode_selection_cache_state)
+        self.assertIsNone(algorithm._decode_selection_cache_mode)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         captured_widths = {}
@@ -580,6 +869,7 @@ class TestQuestAllFourIntegration(unittest.TestCase):
         self.assertFalse(algorithm.states.last_constructed_page.any().item())
         algorithm.finalize_forward(forward_batch)
         torch.cuda.synchronize()
+        self.assertIsNone(algorithm._decode_selection_cache_state)
         torch.testing.assert_close(
             algorithm.states.last_constructed_page,
             (seq_lens - 1) // page_size,
@@ -611,6 +901,7 @@ class TestQuestAllFourIntegration(unittest.TestCase):
         self.assertFalse(algorithm.states.last_constructed_page.any().item())
         algorithm.finalize_forward(forward_batch)
         torch.cuda.synchronize()
+        self.assertIsNone(algorithm._decode_selection_cache_state)
         self.assertTrue(metadata_prepared)
         self.assertLessEqual(selected_pages.shape[1], max_selected_pages)
         self.assertTrue(torch.all(valid_lengths <= max_selected_pages).item())

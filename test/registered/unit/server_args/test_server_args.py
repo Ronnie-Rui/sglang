@@ -522,6 +522,78 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
                 ):
                     parse_runtime_sparse_config(server_args)
 
+    def test_quest_runtime_defaults_decode_token_selection_reuse_interval(self):
+        from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import (
+            QuestAlgorithm,
+        )
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            attention_backend="fa3",
+            page_size=16,
+            hisparse_config=('{"algorithm":"quest","backend":"fa3","page_size":16}'),
+        )
+
+        config = parse_runtime_sparse_config(server_args)
+        algorithm = QuestAlgorithm(config, device=None)
+
+        self.assertNotIn(
+            "decode_token_selection_reuse_interval", config.sparse_extra_config
+        )
+        self.assertEqual(algorithm.decode_token_selection_reuse_interval, 1)
+
+    def test_quest_runtime_accepts_decode_token_selection_reuse_interval(self):
+        for interval in (1, 2, 4):
+            with self.subTest(interval=interval):
+                hisparse_config = {
+                    "algorithm": "quest",
+                    "backend": "fa3",
+                    "page_size": 16,
+                    "decode_token_selection_reuse_interval": interval,
+                }
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=json.dumps(hisparse_config),
+                )
+
+                config = parse_runtime_sparse_config(server_args)
+
+                self.assertEqual(
+                    config.sparse_extra_config["decode_token_selection_reuse_interval"],
+                    interval,
+                )
+
+    def test_quest_runtime_rejects_invalid_decode_token_selection_reuse_interval(
+        self,
+    ):
+        for interval in (None, True, False, 2.0, "2", 0, -1):
+            with self.subTest(interval=interval):
+                hisparse_config = {
+                    "algorithm": "quest",
+                    "backend": "fa3",
+                    "page_size": 16,
+                    "decode_token_selection_reuse_interval": interval,
+                }
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=json.dumps(hisparse_config),
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError, "decode_token_selection_reuse_interval"
+                ):
+                    parse_runtime_sparse_config(server_args)
+
     def test_quest_runtime_validates_layer_page_budget(self):
         invalid_budgets = (
             '"not-a-list"',

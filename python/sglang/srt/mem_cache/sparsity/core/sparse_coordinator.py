@@ -399,15 +399,30 @@ class SparseCoordinator:
             **kwargs,
         )
         metadata_prepared = False
-        if len(retrieval_result) == 3:
+        selected_physical_indices = None
+        if len(retrieval_result) == 4:
+            (
+                selected_indices,
+                valid_lengths,
+                metadata_prepared,
+                selected_physical_indices,
+            ) = retrieval_result
+        elif len(retrieval_result) == 3:
             selected_indices, valid_lengths, metadata_prepared = retrieval_result
-        else:
+        elif len(retrieval_result) == 2:
             selected_indices, valid_lengths = retrieval_result
-        selected_physical_indices = (
-            self.algorithm.get_selected_physical_pages(selected_indices)
-            if self.backend_adaptor.requires_selected_physical_indices
-            else None
-        )
+        else:
+            raise ValueError(
+                "Sparse retrieval must return 2, 3, or 4 values; "
+                f"got {len(retrieval_result)}."
+            )
+        if (
+            selected_physical_indices is None
+            and self.backend_adaptor.requires_selected_physical_indices
+        ):
+            selected_physical_indices = self.algorithm.get_selected_physical_pages(
+                selected_indices
+            )
 
         # Adapt Attention Metadata
         return self.backend_adaptor.adapt_for_attn_metadata(

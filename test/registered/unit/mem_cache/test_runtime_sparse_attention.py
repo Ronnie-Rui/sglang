@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgori
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     FlashAttentionAdaptor,
 )
+from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import SparseCoordinator
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.models.utils import enable_fused_set_kv_buffer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -52,6 +53,54 @@ class TestFlashAttentionAdaptor(unittest.TestCase):
             )
 
         self.assertEqual(metadata.page_table.tolist(), [[7, 3]])
+
+    def test_explicit_physical_retrieval_result_bypasses_algorithm_remap(self):
+        coordinator = object.__new__(SparseCoordinator)
+        logical_pages = torch.tensor([[0, 1]], dtype=torch.int32)
+        physical_pages = torch.tensor([[7, 3]], dtype=torch.int32)
+        valid_lengths = torch.tensor([2], dtype=torch.int32)
+        coordinator._forward_sparse_mask = torch.tensor([True])
+        coordinator.page_size = 4
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor(
+                [[16, 17, 18, 19, 24, 25, 26, 27]], dtype=torch.int64
+            )
+        )
+        coordinator.algorithm = SimpleNamespace(
+            should_update_metadata_lengths=Mock(return_value=True),
+            retrieve_topk=Mock(
+                return_value=(
+                    logical_pages,
+                    valid_lengths,
+                    False,
+                    physical_pages,
+                )
+            ),
+            get_selected_physical_pages=Mock(
+                side_effect=AssertionError("explicit physical pages were remapped")
+            ),
+        )
+        coordinator.backend_adaptor = SimpleNamespace(
+            requires_selected_physical_indices=True,
+            adapt_for_attn_metadata=Mock(return_value="adapted"),
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([8], dtype=torch.int64),
+        )
+
+        result = coordinator._handle_sparse_retrieve(
+            query=torch.empty((1, 1)),
+            layer=SimpleNamespace(layer_id=0),
+            forward_batch=forward_batch,
+            attn_metadata=object(),
+        )
+
+        self.assertEqual(result, "adapted")
+        coordinator.algorithm.get_selected_physical_pages.assert_not_called()
+        call = coordinator.backend_adaptor.adapt_for_attn_metadata.call_args
+        self.assertIs(call.kwargs["selected_indices"], logical_pages)
+        self.assertIs(call.kwargs["selected_physical_indices"], physical_pages)
 
     def test_rewrites_flashattention_metadata_in_place(self):
         adaptor = FlashAttentionAdaptor(torch.device("cpu"))
@@ -523,7 +572,7 @@ class TestQuestFlashAttentionMetadataKernel(unittest.TestCase):
         }
 
     @staticmethod
-    def _run_kernel(inputs, *, update_lengths):
+    def _run_kernel(inputs, *, update_lengths, selected_indices_are_physical=False):
         from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
             quest_update_flashattention_metadata_,
         )
@@ -532,6 +581,7 @@ class TestQuestFlashAttentionMetadataKernel(unittest.TestCase):
             **inputs,
             page_size=4,
             update_lengths=update_lengths,
+            selected_indices_are_physical=selected_indices_are_physical,
         )
 
     def test_updates_ragged_mixed_metadata_in_place(self):
@@ -617,6 +667,55 @@ class TestQuestFlashAttentionMetadataKernel(unittest.TestCase):
         )
         self.assertEqual(inputs["cache_seqlens_int32"].cpu().tolist(), [8, 1, 4])
         self.assertEqual(inputs["cu_seqlens_k"].cpu().tolist(), [0, 8, 9, 13])
+        self.assertEqual(inputs["page_table"].data_ptr(), page_table_ptr)
+        self.assertEqual(inputs["cache_seqlens_int32"].data_ptr(), cache_seqlens_ptr)
+        self.assertEqual(inputs["cu_seqlens_k"].data_ptr(), cu_seqlens_ptr)
+
+    def test_physical_pages_bypass_mapping_during_cuda_graph_replay(self):
+        inputs = self._make_inputs()
+        inputs["selected_indices"].copy_(
+            torch.tensor([[17, 13], [9, -1], [5, -1]], device="cuda")
+        )
+        self._run_kernel(
+            inputs,
+            update_lengths=True,
+            selected_indices_are_physical=True,
+        )
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._run_kernel(
+                inputs,
+                update_lengths=True,
+                selected_indices_are_physical=True,
+            )
+
+        page_table_ptr = inputs["page_table"].data_ptr()
+        cache_seqlens_ptr = inputs["cache_seqlens_int32"].data_ptr()
+        cu_seqlens_ptr = inputs["cu_seqlens_k"].data_ptr()
+        inputs["selected_indices"].copy_(
+            torch.tensor([[7, 11], [15, -1], [19, -1]], device="cuda")
+        )
+        inputs["valid_lengths"].copy_(torch.tensor([2, 1, 1], device="cuda"))
+        inputs["seq_lens"].copy_(torch.tensor([9, 6, 3], device="cuda"))
+        inputs["page_table"].copy_(
+            torch.tensor(
+                [[10, 11, 12], [20, 21, 22], [30, 31, 32]],
+                dtype=torch.int32,
+                device="cuda",
+            )
+        )
+
+        graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            inputs["page_table"].cpu().tolist(),
+            [[7, 11, 12], [15, 21, 22], [19, 31, 32]],
+        )
+        self.assertEqual(inputs["cache_seqlens_int32"].cpu().tolist(), [5, 2, 3])
+        self.assertEqual(inputs["cu_seqlens_k"].cpu().tolist(), [0, 5, 7, 10])
         self.assertEqual(inputs["page_table"].data_ptr(), page_table_ptr)
         self.assertEqual(inputs["cache_seqlens_int32"].data_ptr(), cache_seqlens_ptr)
         self.assertEqual(inputs["cu_seqlens_k"].data_ptr(), cu_seqlens_ptr)

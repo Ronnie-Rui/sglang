@@ -153,7 +153,20 @@ class FlashAttentionAdaptor(BackendAdaptor):
         if self._original_metadata is None:
             return current_metadata
 
-        max_selected = selected_indices.shape[1]
+        if (
+            selected_physical_indices is not None
+            and selected_physical_indices.shape != selected_indices.shape
+        ):
+            raise ValueError(
+                "Explicit physical page indices must match selected_indices shape: "
+                f"{selected_physical_indices.shape} != {selected_indices.shape}."
+            )
+        selected_pages = (
+            selected_physical_indices
+            if selected_physical_indices is not None
+            else selected_indices
+        )
+        max_selected = selected_pages.shape[1]
         metadata_prepared = bool(kwargs.get("metadata_prepared", False))
         update_metadata_lengths = bool(
             kwargs.get("update_metadata_lengths", not self._metadata_prepared)
@@ -181,7 +194,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
             return current_metadata
 
         use_triton_metadata_kernel = (
-            selected_indices.is_cuda
+            selected_pages.is_cuda
             and torch.version.hip is None
             and valid_lengths.is_cuda
             and sparse_mask.is_cuda
@@ -215,7 +228,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
             )
 
             quest_update_flashattention_metadata_(
-                selected_indices=selected_indices,
+                selected_indices=selected_pages,
                 valid_lengths=valid_lengths,
                 sparse_mask=sparse_mask,
                 seq_lens=forward_batch.seq_lens,
@@ -226,6 +239,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
                 cu_seqlens_k=current_metadata.cu_seqlens_k,
                 page_size=page_size,
                 update_lengths=update_lengths,
+                selected_indices_are_physical=selected_physical_indices is not None,
             )
             if update_lengths:
                 current_metadata.max_seq_len_k = max(
