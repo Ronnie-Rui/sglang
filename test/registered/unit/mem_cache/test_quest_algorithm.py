@@ -1879,6 +1879,81 @@ class TestQuestLayerReuseAndBudget(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestQuestSuperpageIntegration(unittest.TestCase):
+    def test_lazy_path_materializes_ready_pages_before_superpage_bounds(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        seq_lens = torch.tensor([17], dtype=torch.int64, device=device)
+        algorithm, k_buffer = _make_algorithm(
+            batch_size=1,
+            seq_lens=seq_lens,
+            page_size=2,
+            sparsity_ratio=0.125,
+            num_recent_pages=1,
+            kv_heads=1,
+            head_dim=8,
+            device=device,
+            seed=91,
+            sparse_extra_config={
+                "use_lazy_page_update_score_kernel": True,
+                "quest_superpage_size": 2,
+                "quest_superpage_oversample": 1,
+            },
+        )
+        req_pool_indices = torch.zeros(1, dtype=torch.int64, device=device)
+        sparse_mask = torch.ones(1, dtype=torch.bool, device=device)
+        queries = torch.randn((1, 1, 8), device=device)
+
+        # Pages [0, 7) were previously tracked. At attention_begin for length
+        # 17, page 7 is newly safe: (17 - 1) // 2 == 8.
+        algorithm._compute_page_representations(
+            0,
+            req_pool_indices,
+            seq_lens,
+            0,
+            torch.tensor([7], dtype=torch.int64, device=device),
+            k_buffer,
+        )
+        algorithm.states.repr_constructed[0] = True
+        algorithm.states.last_constructed_page[0] = 7
+        self.assertFalse(algorithm.page_valid[0][7].item())
+
+        forward_batch = _FakeForwardBatch(seq_lens)
+        algorithm.begin_forward(
+            forward_batch,
+            req_pool_indices,
+            sparse_mask,
+            device,
+            fixed_capacity=False,
+        )
+        hierarchical_indices, hierarchical_lengths = algorithm.retrieve_topk(
+            queries,
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )[:2]
+
+        self.assertTrue(algorithm._lazy_page_update_active)
+        self.assertTrue(algorithm.page_valid[0][7].item())
+        self.assertIsNotNone(algorithm._last_superpage_certified)
+
+        algorithm.quest_superpage_size = 1
+        algorithm._lazy_page_update_active = False
+        full_indices, full_lengths = algorithm.retrieve_topk(
+            queries,
+            0,
+            req_pool_indices,
+            sparse_mask,
+            forward_batch=forward_batch,
+        )[:2]
+        torch.testing.assert_close(hierarchical_lengths, full_lengths)
+        self.assertEqual(
+            _sorted_rows(hierarchical_indices.cpu(), hierarchical_lengths.cpu()),
+            _sorted_rows(full_indices.cpu(), full_lengths.cpu()),
+        )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestQuestFixedCapacityCudaGraph(unittest.TestCase):
     @unittest.skipIf(torch.version.hip is not None, "NVIDIA CUDA is required")
     def test_context_adaptive_restored_anchor_materializes_missed_pages(self):

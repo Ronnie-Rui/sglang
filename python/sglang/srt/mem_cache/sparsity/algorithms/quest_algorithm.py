@@ -18,6 +18,8 @@ from sglang.srt.arg_groups.hisparse_hook import (
     QUEST_DECODE_TOKEN_SELECTION_REUSE_INTERVAL_OPTION,
     QUEST_MAX_SELECTED_TOKENS_OPTION,
     QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION,
+    QUEST_SUPERPAGE_OVERSAMPLE_OPTION,
+    QUEST_SUPERPAGE_SIZE_OPTION,
     resolve_quest_page_bounds_dtype,
 )
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
@@ -104,6 +106,12 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.decode_token_selection_reuse_interval = config.sparse_extra_config.get(
             QUEST_DECODE_TOKEN_SELECTION_REUSE_INTERVAL_OPTION, 1
         )
+        self.quest_superpage_size = config.sparse_extra_config.get(
+            QUEST_SUPERPAGE_SIZE_OPTION, 1
+        )
+        self.quest_superpage_oversample = config.sparse_extra_config.get(
+            QUEST_SUPERPAGE_OVERSAMPLE_OPTION, 2
+        )
         self.layer_page_budget = tuple(
             (
                 budget_range["start_layer"],
@@ -125,6 +133,9 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self._decode_selection_graph_bypass_logged = False
         self._lazy_page_update_active = False
         self._lazy_page_update_graph_states = {}
+        self._last_superpage_certified = None
+        self._last_superpage_candidate_group_count = 0
+        self._superpage_certified_by_plan = {}
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
@@ -143,6 +154,8 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             self.layer_selection_reuse_interval
         )
         self._context_adaptive_layer_selection_reuse_active = False
+        self._last_superpage_certified = None
+        self._last_superpage_candidate_group_count = 0
         fixed_capacity = kwargs.get(
             "fixed_capacity", args[4] if len(args) > 4 else False
         )
@@ -945,7 +958,112 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             and next(iter(self.page_k_min.values())).shape[-1] <= 256
         )
 
+    def _superpage_candidate_group_count(self, plan) -> int:
+        minimum_groups = (
+            plan.max_k + self.quest_superpage_size - 1
+        ) // self.quest_superpage_size
+        num_superpages = (
+            plan.max_num_pages + self.quest_superpage_size - 1
+        ) // self.quest_superpage_size
+        return min(
+            num_superpages,
+            max(1, minimum_groups * self.quest_superpage_oversample),
+        )
+
+    def _can_use_superpage_scoring(self, queries: torch.Tensor, plan) -> bool:
+        if (
+            self.quest_superpage_size <= 1
+            or plan is None
+            or plan.max_k <= 0
+            or plan.max_num_pages <= self.quest_superpage_size
+            or not self._can_use_triton_score_kernel(queries)
+            or not plan.physical_pages.is_cuda
+            or plan.active_mask.dtype != torch.bool
+            or plan.k_per_req.dtype not in (torch.int32, torch.int64)
+        ):
+            return False
+
+        num_superpages = (
+            plan.max_num_pages + self.quest_superpage_size - 1
+        ) // self.quest_superpage_size
+        if self._superpage_candidate_group_count(plan) >= num_superpages:
+            return False
+
+        if not self._lazy_page_update_active:
+            return True
+        return self._can_use_triton_page_update(
+            plan.req_pool_indices,
+            plan.seq_lens,
+            self.token_to_kv_pool.get_key_buffer(self.start_layer),
+        )
+
+    def _try_superpage_page_scores(
+        self, layer_id: int, queries: torch.Tensor, plan
+    ) -> torch.Tensor | None:
+        if not self._can_use_superpage_scoring(queries, plan):
+            return None
+
+        if self._lazy_page_update_active:
+            # attention_begin precedes this token's K write. Materialize only
+            # pages completed by the preceding token, matching the fused lazy
+            # score kernel's ready_end_page calculation.
+            from sglang.srt.mem_cache.sparsity.kernels.quest_page_update import (
+                quest_update_page_representations_,
+            )
+
+            safe_seq_lens = torch.clamp(plan.seq_lens - 1, min=0)
+            repr_constructed, last_constructed_page = (
+                self.get_layer_representation_trackers(layer_id)
+            )
+            quest_update_page_representations_(
+                plan.req_pool_indices,
+                safe_seq_lens,
+                self.req_to_token_pool.req_to_token,
+                self.token_to_kv_pool.get_key_buffer(layer_id),
+                repr_constructed,
+                last_constructed_page,
+                self.page_k_min[layer_id],
+                self.page_k_max[layer_id],
+                self.page_valid[layer_id],
+                self.page_size,
+                advance_trackers=False,
+            )
+
+        from sglang.srt.mem_cache.sparsity.kernels.quest_score import (
+            quest_exact_superpage_page_scores,
+        )
+
+        scores, certified = quest_exact_superpage_page_scores(
+            queries=queries,
+            page_k_min=self.page_k_min[layer_id],
+            page_k_max=self.page_k_max[layer_id],
+            page_valid=self.page_valid[layer_id],
+            physical_pages=plan.physical_pages,
+            active_mask=plan.active_mask,
+            history_page_counts=plan.recent_start,
+            k_per_req=plan.k_per_req,
+            max_k=plan.max_k,
+            superpage_size=self.quest_superpage_size,
+            oversample=self.quest_superpage_oversample,
+        )
+        self._last_superpage_certified = certified
+        self._last_superpage_candidate_group_count = (
+            self._superpage_candidate_group_count(plan)
+        )
+        plan_key = (
+            bool(plan.fixed_capacity),
+            plan.batch_size,
+            plan.max_num_pages,
+            plan.max_k,
+        )
+        self._superpage_certified_by_plan[plan_key] = certified
+        return scores
+
     def _retrieve_page_scores_batched(self, layer_id, queries, plan) -> torch.Tensor:
+        superpage_scores = self._try_superpage_page_scores(layer_id, queries, plan)
+        if superpage_scores is not None:
+            return superpage_scores
+
         if getattr(
             self, "_lazy_page_update_active", False
         ) and self._can_use_triton_score_kernel(queries):
@@ -1000,11 +1118,15 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         queries: torch.Tensor,
     ) -> torch.Tensor:
         physical_pages = phys_pages
+        plan = self._retrieval_plan
+        if plan is not None:
+            superpage_scores = self._try_superpage_page_scores(layer_id, queries, plan)
+            if superpage_scores is not None:
+                return superpage_scores
 
         if getattr(
             self, "_lazy_page_update_active", False
         ) and self._can_use_triton_score_kernel(queries):
-            plan = self._retrieval_plan
             if plan is None:
                 raise RuntimeError("Quest lazy page update requires a retrieval plan")
 

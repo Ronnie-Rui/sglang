@@ -31,6 +31,8 @@ QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_INTERVAL_OPTION = (
 QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_MIN_PAGES_OPTION = (
     "context_adaptive_layer_selection_reuse_min_pages"
 )
+QUEST_SUPERPAGE_SIZE_OPTION = "quest_superpage_size"
+QUEST_SUPERPAGE_OVERSAMPLE_OPTION = "quest_superpage_oversample"
 
 
 def _load_hisparse_config(server_args: ServerArgs) -> dict:

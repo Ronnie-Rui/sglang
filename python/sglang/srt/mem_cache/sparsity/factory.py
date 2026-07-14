@@ -10,6 +10,8 @@ from sglang.srt.arg_groups.hisparse_hook import (
     QUEST_DECODE_TOKEN_SELECTION_REUSE_INTERVAL_OPTION,
     QUEST_MAX_SELECTED_TOKENS_OPTION,
     QUEST_NATIVE_PAGE_BOUNDS_DTYPE_OPTION,
+    QUEST_SUPERPAGE_OVERSAMPLE_OPTION,
+    QUEST_SUPERPAGE_SIZE_OPTION,
 )
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_dsa import DeepSeekDSAAlgorithm
@@ -315,6 +317,32 @@ def parse_runtime_sparse_config(server_args) -> SparseConfig:
                 "must be a positive integer, "
                 f"got {decode_token_selection_reuse_interval!r}."
             )
+
+    quest_superpage_size = config.sparse_extra_config.get(
+        QUEST_SUPERPAGE_SIZE_OPTION, 1
+    )
+    if (
+        not isinstance(quest_superpage_size, int)
+        or isinstance(quest_superpage_size, bool)
+        or quest_superpage_size not in (1, 2, 4, 8, 16)
+    ):
+        raise ValueError(
+            "Sparse runtime config quest_superpage_size must be one of "
+            f"1, 2, 4, 8, or 16; got {quest_superpage_size!r}."
+        )
+
+    quest_superpage_oversample = config.sparse_extra_config.get(
+        QUEST_SUPERPAGE_OVERSAMPLE_OPTION, 2
+    )
+    if (
+        not isinstance(quest_superpage_oversample, int)
+        or isinstance(quest_superpage_oversample, bool)
+        or quest_superpage_oversample <= 0
+    ):
+        raise ValueError(
+            "Sparse runtime config quest_superpage_oversample must be a positive "
+            f"integer, got {quest_superpage_oversample!r}."
+        )
 
     layer_page_budget = config.sparse_extra_config.get("layer_page_budget")
     if layer_page_budget is not None:

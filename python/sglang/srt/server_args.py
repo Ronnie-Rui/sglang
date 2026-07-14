@@ -2130,11 +2130,14 @@ class ServerArgs:
                 "use e.g. "
                 '\'{"algorithm":"quest","backend":"fa3","page_size":16,'
                 '"sparsity_ratio":0.5,"quest_max_selected_tokens":2048,'
-                '"decode_token_selection_reuse_interval":2}\'. '
+                '"decode_token_selection_reuse_interval":2,'
+                '"quest_superpage_size":8,"quest_superpage_oversample":2}\'. '
                 "The Quest page_size also configures "
                 "the runtime KV page size; an explicit --page-size must match it. "
                 "Decode-token selection reuse is an opt-in eager-only approximation "
-                "and is disabled inside CUDA Graph execution."
+                "and is disabled inside CUDA Graph execution. Superpage scoring is "
+                "opt-in and exact: requests that fail its device-side upper-bound "
+                "certificate repair all omitted page scores."
             ),
             aliases=["--hierarchical-sparse-attention-extra-config"],
         ),

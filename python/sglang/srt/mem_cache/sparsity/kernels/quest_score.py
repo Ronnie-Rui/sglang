@@ -17,10 +17,15 @@ def _quest_page_score_kernel(
     physical_pages_ptr,
     active_mask_ptr,
     history_page_counts_ptr,
+    candidate_superpages_ptr,
+    repair_mask_ptr,
     output_ptr,
     num_pages,
     num_pool_pages,
     APPLY_RETRIEVAL_MASK: tl.constexpr,
+    FILTER_SUPERPAGES: tl.constexpr,
+    REPAIR_ONLY: tl.constexpr,
+    SUPERPAGE_SIZE: tl.constexpr,
     Q_HEADS: tl.constexpr,
     KV_HEADS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
@@ -36,6 +41,17 @@ def _quest_page_score_kernel(
         request_is_active = tl.load(active_mask_ptr + batch_idx).to(tl.int1)
         history_page_count = tl.load(history_page_counts_ptr + batch_idx)
         page_is_selected &= request_is_active & (page_idx < history_page_count)
+    if FILTER_SUPERPAGES:
+        num_superpages = tl.cdiv(num_pages, SUPERPAGE_SIZE)
+        superpage_idx = page_idx // SUPERPAGE_SIZE
+        is_candidate = tl.load(
+            candidate_superpages_ptr + batch_idx * num_superpages + superpage_idx
+        ).to(tl.int1)
+        if REPAIR_ONLY:
+            repair_request = tl.load(repair_mask_ptr + batch_idx).to(tl.int1)
+            page_is_selected &= repair_request & ~is_candidate
+        else:
+            page_is_selected &= is_candidate
     physical_page = tl.where(page_in_bounds, physical_page_raw, 0)
     page_is_valid = tl.load(
         page_valid_ptr + physical_page, mask=page_is_selected, other=0
@@ -69,7 +85,125 @@ def _quest_page_score_kernel(
             best_bound = tl.maximum(best_bound, head_bound)
 
     score = tl.where(page_is_selected & page_is_valid, best_bound, -float("inf"))
-    tl.store(output_ptr + batch_idx * num_pages + page_idx, score)
+    if REPAIR_ONLY:
+        tl.store(
+            output_ptr + batch_idx * num_pages + page_idx,
+            score,
+            mask=page_is_selected,
+        )
+    else:
+        tl.store(output_ptr + batch_idx * num_pages + page_idx, score)
+
+
+@triton.jit
+def _quest_superpage_score_kernel(
+    queries_ptr,
+    page_k_min_ptr,
+    page_k_max_ptr,
+    page_valid_ptr,
+    physical_pages_ptr,
+    active_mask_ptr,
+    history_page_counts_ptr,
+    output_ptr,
+    num_pages,
+    num_pool_pages,
+    SUPERPAGE_SIZE: tl.constexpr,
+    Q_HEADS: tl.constexpr,
+    KV_HEADS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    superpage_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1)
+    request_is_active = tl.load(active_mask_ptr + batch_idx).to(tl.int1)
+    history_page_count = tl.load(history_page_counts_ptr + batch_idx)
+
+    dim_offsets = tl.arange(0, BLOCK_D)
+    dim_in_bounds = dim_offsets < HEAD_DIM
+    best_bound = -float("inf")
+    superpage_has_valid_page = False
+    superpage_has_nonfinite_bound = False
+
+    for kv_head in range(KV_HEADS):
+        superpage_min = tl.full((BLOCK_D,), float("inf"), tl.float32)
+        superpage_max = tl.full((BLOCK_D,), -float("inf"), tl.float32)
+        head_has_valid_page = False
+        head_has_nonfinite_bound = False
+
+        for page_offset in range(SUPERPAGE_SIZE):
+            page_idx = superpage_idx * SUPERPAGE_SIZE + page_offset
+            logical_page_valid = (
+                request_is_active
+                & (page_idx < num_pages)
+                & (page_idx < history_page_count)
+            )
+            physical_page_raw = tl.load(
+                physical_pages_ptr + batch_idx * num_pages + page_idx,
+                mask=page_idx < num_pages,
+                other=-1,
+            )
+            page_in_bounds = (
+                logical_page_valid
+                & (physical_page_raw >= 0)
+                & (physical_page_raw < num_pool_pages)
+            )
+            physical_page = tl.where(page_in_bounds, physical_page_raw, 0)
+            page_is_valid = tl.load(
+                page_valid_ptr + physical_page,
+                mask=page_in_bounds,
+                other=0,
+            ).to(tl.int1)
+            include_page = page_in_bounds & page_is_valid
+            key_offsets = (
+                physical_page * KV_HEADS * HEAD_DIM + kv_head * HEAD_DIM + dim_offsets
+            )
+            key_min = tl.load(
+                page_k_min_ptr + key_offsets,
+                mask=dim_in_bounds & include_page,
+                other=float("inf"),
+            ).to(tl.float32)
+            key_max = tl.load(
+                page_k_max_ptr + key_offsets,
+                mask=dim_in_bounds & include_page,
+                other=-float("inf"),
+            ).to(tl.float32)
+            nonfinite_bound = (
+                dim_in_bounds
+                & include_page
+                & (
+                    (key_min != key_min)
+                    | (key_max != key_max)
+                    | (tl.abs(key_min) == float("inf"))
+                    | (tl.abs(key_max) == float("inf"))
+                )
+            )
+            superpage_min = tl.minimum(superpage_min, key_min)
+            superpage_max = tl.maximum(superpage_max, key_max)
+            head_has_valid_page |= include_page
+            head_has_nonfinite_bound |= tl.sum(nonfinite_bound.to(tl.int32), axis=0) > 0
+
+        superpage_has_valid_page |= head_has_valid_page
+        superpage_has_nonfinite_bound |= head_has_nonfinite_bound
+        query_mask = dim_in_bounds & head_has_valid_page
+        for group_idx in range(GROUP_SIZE):
+            query_head = kv_head * GROUP_SIZE + group_idx
+            query_offsets = (
+                batch_idx * Q_HEADS * HEAD_DIM + query_head * HEAD_DIM + dim_offsets
+            )
+            query = tl.load(
+                queries_ptr + query_offsets,
+                mask=query_mask,
+                other=0.0,
+            ).to(tl.float32)
+            bound_keys = tl.where(query >= 0, superpage_max, superpage_min)
+            head_bound = tl.sum(query * bound_keys, axis=0)
+            best_bound = tl.maximum(best_bound, head_bound)
+
+    score = tl.where(superpage_has_valid_page, best_bound, -float("inf"))
+    score = tl.where(superpage_has_nonfinite_bound, float("inf"), score)
+    num_superpages = tl.cdiv(num_pages, SUPERPAGE_SIZE)
+    tl.store(output_ptr + batch_idx * num_superpages + superpage_idx, score)
 
 
 @triton.jit
@@ -340,6 +474,10 @@ def quest_page_scores(
     *,
     active_mask: torch.Tensor | None = None,
     history_page_counts: torch.Tensor | None = None,
+    candidate_superpages: torch.Tensor | None = None,
+    superpage_size: int = 1,
+    repair_mask: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute Quest's conservative per-page GQA bound without intermediates.
 
@@ -347,7 +485,9 @@ def quest_page_scores(
     and ``history_page_counts`` are provided, inactive requests and logical
     recent/padding pages are masked in the same kernel. The representation
     tensors are persistent contiguous pools in Quest; they are deliberately
-    not copied here because doing so would dominate scoring.
+    not copied here because doing so would dominate scoring. ``candidate_superpages``
+    optionally restricts scoring to logical page groups. Supplying ``repair_mask``
+    updates only omitted pages for requests whose exactness certificate failed.
     """
     if not queries.is_cuda:
         raise ValueError("quest_page_scores requires CUDA tensors")
@@ -405,6 +545,43 @@ def quest_page_scores(
         ):
             raise ValueError("Quest retrieval masks must share the score tensor device")
 
+    filter_superpages = candidate_superpages is not None
+    repair_only = repair_mask is not None
+    if repair_only and not filter_superpages:
+        raise ValueError("Quest superpage repair requires a candidate mask")
+    if filter_superpages:
+        if (
+            not isinstance(superpage_size, int)
+            or isinstance(superpage_size, bool)
+            or superpage_size <= 1
+        ):
+            raise ValueError("Quest superpage size must be an integer greater than one")
+        expected_superpages = (
+            physical_pages.shape[1] + superpage_size - 1
+        ) // superpage_size
+        if (
+            candidate_superpages.shape != (physical_pages.shape[0], expected_superpages)
+            or candidate_superpages.dtype != torch.bool
+        ):
+            raise ValueError(
+                "Quest candidate superpages must be bool with shape "
+                "[batch, ceil(pages / superpage_size)]"
+            )
+        if candidate_superpages.device != queries.device:
+            raise ValueError("Quest candidate superpages must share the score device")
+        if not candidate_superpages.is_contiguous():
+            candidate_superpages = candidate_superpages.contiguous()
+    if repair_only:
+        if (
+            repair_mask.shape != (physical_pages.shape[0],)
+            or repair_mask.dtype != torch.bool
+        ):
+            raise ValueError("Quest repair mask must be bool with shape [batch]")
+        if repair_mask.device != queries.device:
+            raise ValueError("Quest repair mask must share the score device")
+        if not repair_mask.is_contiguous():
+            repair_mask = repair_mask.contiguous()
+
     num_pool_pages, kv_heads, head_dim = page_k_min.shape
     if kv_heads <= 0 or head_dim <= 0:
         raise ValueError("Quest page representations require positive head dimensions")
@@ -452,9 +629,22 @@ def quest_page_scores(
             history_page_counts = history_page_counts.contiguous()
 
     num_pages = physical_pages.shape[1]
-    output = torch.empty(
-        (batch_size, num_pages), dtype=torch.float32, device=queries.device
-    )
+    expected_output_shape = (batch_size, num_pages)
+    if output is None:
+        if repair_only:
+            raise ValueError("Quest repair requires the candidate score output")
+        output = torch.empty(
+            expected_output_shape, dtype=torch.float32, device=queries.device
+        )
+    elif (
+        output.shape != expected_output_shape
+        or output.dtype != torch.float32
+        or output.device != queries.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "Quest score output must be contiguous float32 with shape [batch, pages]"
+        )
     if batch_size == 0 or num_pages == 0:
         return output
     if num_pool_pages == 0:
@@ -465,6 +655,10 @@ def quest_page_scores(
     history_page_counts_arg = (
         history_page_counts if apply_retrieval_mask else physical_pages
     )
+    candidate_superpages_arg = (
+        candidate_superpages if filter_superpages else physical_pages
+    )
+    repair_mask_arg = repair_mask if repair_only else physical_pages
     _quest_page_score_kernel[(num_pages, batch_size)](
         queries,
         page_k_min,
@@ -473,10 +667,15 @@ def quest_page_scores(
         physical_pages,
         active_mask_arg,
         history_page_counts_arg,
+        candidate_superpages_arg,
+        repair_mask_arg,
         output,
         num_pages,
         num_pool_pages,
         APPLY_RETRIEVAL_MASK=apply_retrieval_mask,
+        FILTER_SUPERPAGES=filter_superpages,
+        REPAIR_ONLY=repair_only,
+        SUPERPAGE_SIZE=superpage_size,
         Q_HEADS=query_heads,
         KV_HEADS=kv_heads,
         GROUP_SIZE=query_heads // kv_heads,
@@ -485,6 +684,246 @@ def quest_page_scores(
         num_warps=4,
     )
     return output
+
+
+def quest_superpage_scores(
+    queries: torch.Tensor,
+    page_k_min: torch.Tensor,
+    page_k_max: torch.Tensor,
+    page_valid: torch.Tensor,
+    physical_pages: torch.Tensor,
+    active_mask: torch.Tensor,
+    history_page_counts: torch.Tensor,
+    superpage_size: int,
+) -> torch.Tensor:
+    """Score conservative logical superpage bounds on NVIDIA CUDA.
+
+    Each superpage takes the elementwise minimum/maximum over its valid member
+    pages. Its Quest score therefore upper-bounds every member page score.
+    """
+    if not queries.is_cuda or torch.version.hip is not None:
+        raise ValueError("Quest superpage scoring requires NVIDIA CUDA tensors")
+    if (
+        not isinstance(superpage_size, int)
+        or isinstance(superpage_size, bool)
+        or not 2 <= superpage_size <= 16
+    ):
+        raise ValueError("Quest superpage size must be an integer in [2, 16]")
+    if page_k_min.ndim != 3 or page_k_max.shape != page_k_min.shape:
+        raise ValueError(
+            "Quest page min/max tensors must have matching [pages, heads, dim] shapes"
+        )
+    validate_quest_page_bounds_dtype(page_k_min, page_k_max)
+    if not page_k_min.is_contiguous() or not page_k_max.is_contiguous():
+        raise ValueError("Quest page min/max tensors must be contiguous")
+    num_pool_pages, kv_heads, head_dim = page_k_min.shape
+    if (
+        page_valid.shape != (num_pool_pages,)
+        or page_valid.dtype != torch.bool
+        or not page_valid.is_contiguous()
+    ):
+        raise ValueError("Quest page validity must be a contiguous bool vector")
+    if physical_pages.ndim != 2 or physical_pages.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError(
+            "Quest physical pages must be an integer [batch, pages] tensor"
+        )
+    if (
+        active_mask.shape != (physical_pages.shape[0],)
+        or active_mask.dtype != torch.bool
+    ):
+        raise ValueError("Quest active mask must be bool with shape [batch]")
+    if history_page_counts.shape != (
+        physical_pages.shape[0],
+    ) or history_page_counts.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("Quest history page counts must be integer with shape [batch]")
+    if any(
+        tensor.device != queries.device
+        for tensor in (
+            page_k_min,
+            page_k_max,
+            page_valid,
+            physical_pages,
+            active_mask,
+            history_page_counts,
+        )
+    ):
+        raise ValueError("Quest superpage tensors must share one CUDA device")
+    if kv_heads <= 0 or not 0 < head_dim <= 256:
+        raise ValueError("Quest superpage representations require head_dim in [1, 256]")
+
+    if queries.ndim == 2:
+        batch_size, hidden_size = queries.shape
+        if hidden_size % head_dim != 0:
+            raise ValueError(
+                f"Quest query hidden size {hidden_size} not divisible by head_dim {head_dim}"
+            )
+        query_heads = hidden_size // head_dim
+        queries = queries.reshape(batch_size, query_heads, head_dim)
+    elif queries.ndim == 3:
+        batch_size, query_heads, query_head_dim = queries.shape
+        if query_head_dim != head_dim:
+            raise ValueError(
+                f"Quest query head_dim {query_head_dim} does not match {head_dim}"
+            )
+    else:
+        raise ValueError(f"Unsupported query shape for Quest: {queries.shape}")
+    if physical_pages.shape[0] != batch_size:
+        raise ValueError("Quest physical page batch must match the query batch")
+    if query_heads <= 0 or query_heads % kv_heads != 0:
+        raise ValueError("Quest query heads must be a positive multiple of KV heads")
+
+    if not queries.is_contiguous():
+        queries = queries.contiguous()
+    if not physical_pages.is_contiguous():
+        physical_pages = physical_pages.contiguous()
+    if not active_mask.is_contiguous():
+        active_mask = active_mask.contiguous()
+    if not history_page_counts.is_contiguous():
+        history_page_counts = history_page_counts.contiguous()
+
+    num_pages = physical_pages.shape[1]
+    num_superpages = (num_pages + superpage_size - 1) // superpage_size
+    output = torch.empty(
+        (batch_size, num_superpages), dtype=torch.float32, device=queries.device
+    )
+    if batch_size == 0 or num_superpages == 0:
+        return output
+    if num_pool_pages == 0:
+        raise ValueError("Quest page representation pool cannot be empty")
+
+    _quest_superpage_score_kernel[(num_superpages, batch_size)](
+        queries,
+        page_k_min,
+        page_k_max,
+        page_valid,
+        physical_pages,
+        active_mask,
+        history_page_counts,
+        output,
+        num_pages,
+        num_pool_pages,
+        SUPERPAGE_SIZE=superpage_size,
+        Q_HEADS=query_heads,
+        KV_HEADS=kv_heads,
+        GROUP_SIZE=query_heads // kv_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
+    return output
+
+
+def quest_exact_superpage_page_scores(
+    queries: torch.Tensor,
+    page_k_min: torch.Tensor,
+    page_k_max: torch.Tensor,
+    page_valid: torch.Tensor,
+    physical_pages: torch.Tensor,
+    active_mask: torch.Tensor,
+    history_page_counts: torch.Tensor,
+    k_per_req: torch.Tensor,
+    *,
+    max_k: int,
+    superpage_size: int,
+    oversample: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prune page scoring with a device-side exactness certificate and repair.
+
+    Candidate pages are sufficient only when the candidate kth page score is
+    strictly greater than every omitted superpage upper bound. Requests that
+    fail this certificate repair all omitted page scores before returning.
+    """
+    if not isinstance(max_k, int) or isinstance(max_k, bool) or max_k <= 0:
+        raise ValueError("Quest superpage max_k must be a positive integer")
+    if (
+        not isinstance(oversample, int)
+        or isinstance(oversample, bool)
+        or oversample <= 0
+    ):
+        raise ValueError("Quest superpage oversample must be a positive integer")
+    if k_per_req.shape != (physical_pages.shape[0],) or k_per_req.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("Quest k_per_req must be integer with shape [batch]")
+    if k_per_req.device != queries.device:
+        raise ValueError("Quest k_per_req must share the score device")
+    if max_k > physical_pages.shape[1]:
+        raise ValueError("Quest superpage max_k cannot exceed the page width")
+
+    superpage_scores = quest_superpage_scores(
+        queries,
+        page_k_min,
+        page_k_max,
+        page_valid,
+        physical_pages,
+        active_mask,
+        history_page_counts,
+        superpage_size,
+    )
+    num_superpages = superpage_scores.shape[1]
+    minimum_groups = (max_k + superpage_size - 1) // superpage_size
+    candidate_group_count = min(num_superpages, max(1, minimum_groups * oversample))
+    candidate_group_scores, candidate_group_indices = torch.topk(
+        superpage_scores,
+        k=candidate_group_count,
+        dim=1,
+        sorted=False,
+    )
+    candidate_superpages = torch.zeros_like(superpage_scores, dtype=torch.bool)
+    candidate_superpages.scatter_(
+        1, candidate_group_indices, torch.isfinite(candidate_group_scores)
+    )
+
+    candidate_scores = quest_page_scores(
+        queries,
+        page_k_min,
+        page_k_max,
+        page_valid,
+        physical_pages,
+        active_mask=active_mask,
+        history_page_counts=history_page_counts,
+        candidate_superpages=candidate_superpages,
+        superpage_size=superpage_size,
+    )
+    candidate_top_scores = torch.topk(
+        candidate_scores, k=max_k, dim=1, sorted=True
+    ).values
+    kth_ranks = torch.clamp(k_per_req.to(torch.long) - 1, min=0, max=max_k - 1)
+    candidate_threshold = candidate_top_scores.gather(
+        1, kth_ranks.unsqueeze(1)
+    ).squeeze(1)
+    omitted_upper_bound = torch.where(
+        candidate_superpages,
+        torch.full_like(superpage_scores, float("-inf")),
+        superpage_scores,
+    ).amax(dim=1)
+    needs_selection = active_mask & (k_per_req > 0)
+    certified = (~needs_selection) | (
+        torch.isfinite(candidate_threshold)
+        & (candidate_threshold > omitted_upper_bound)
+    )
+    repair_mask = needs_selection & ~certified
+    quest_page_scores(
+        queries,
+        page_k_min,
+        page_k_max,
+        page_valid,
+        physical_pages,
+        active_mask=active_mask,
+        history_page_counts=history_page_counts,
+        candidate_superpages=candidate_superpages,
+        superpage_size=superpage_size,
+        repair_mask=repair_mask,
+        output=candidate_scores,
+    )
+    return candidate_scores, certified
 
 
 def quest_lazy_update_page_scores(

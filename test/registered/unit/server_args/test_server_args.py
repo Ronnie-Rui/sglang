@@ -667,6 +667,86 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
                 ):
                     parse_runtime_sparse_config(server_args)
 
+    def test_quest_runtime_defaults_superpage_pruning_off(self):
+        from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import (
+            QuestAlgorithm,
+        )
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            attention_backend="fa3",
+            page_size=16,
+            hisparse_config='{"algorithm":"quest","backend":"fa3","page_size":16}',
+        )
+        config = parse_runtime_sparse_config(server_args)
+        algorithm = QuestAlgorithm(config, device=None)
+
+        self.assertNotIn("quest_superpage_size", config.sparse_extra_config)
+        self.assertNotIn("quest_superpage_oversample", config.sparse_extra_config)
+        self.assertEqual(algorithm.quest_superpage_size, 1)
+        self.assertEqual(algorithm.quest_superpage_oversample, 2)
+
+    def test_quest_runtime_accepts_superpage_options(self):
+        for superpage_size in (1, 2, 4, 8, 16):
+            with self.subTest(superpage_size=superpage_size):
+                hisparse_config = {
+                    "algorithm": "quest",
+                    "backend": "fa3",
+                    "page_size": 16,
+                    "quest_superpage_size": superpage_size,
+                    "quest_superpage_oversample": 3,
+                }
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=json.dumps(hisparse_config),
+                )
+                config = parse_runtime_sparse_config(server_args)
+
+                self.assertEqual(
+                    config.sparse_extra_config["quest_superpage_size"],
+                    superpage_size,
+                )
+                self.assertEqual(
+                    config.sparse_extra_config["quest_superpage_oversample"], 3
+                )
+
+    def test_quest_runtime_rejects_invalid_superpage_options(self):
+        invalid_cases = (
+            ("quest_superpage_size", None),
+            ("quest_superpage_size", True),
+            ("quest_superpage_size", 0),
+            ("quest_superpage_size", 3),
+            ("quest_superpage_size", 32),
+            ("quest_superpage_oversample", None),
+            ("quest_superpage_oversample", False),
+            ("quest_superpage_oversample", 0),
+            ("quest_superpage_oversample", 1.5),
+        )
+        for option, value in invalid_cases:
+            with self.subTest(option=option, value=value):
+                hisparse_config = {
+                    "algorithm": "quest",
+                    "backend": "fa3",
+                    "page_size": 16,
+                    option: value,
+                }
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=json.dumps(hisparse_config),
+                )
+                with self.assertRaisesRegex(ValueError, option):
+                    parse_runtime_sparse_config(server_args)
+
     def test_quest_runtime_validates_layer_page_budget(self):
         invalid_budgets = (
             '"not-a-list"',
