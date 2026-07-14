@@ -211,6 +211,26 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             self._active_layer_selection_reuse_interval = adaptive_interval
             self._context_adaptive_layer_selection_reuse_active = True
 
+    def begin_dense_forward(self, forward_batch) -> None:
+        # A dense decode step must not leave selection or lazy-update state
+        # available to a later sparse step in a differently shaped batch.
+        self._selection_cache = None
+        self._selection_cache_group = None
+        self._selection_cache_layer = None
+        self._actual_selection_anchors.clear()
+        self._metadata_length_updates.clear()
+        self._last_metadata_layer = None
+        self._active_layer_selection_reuse_interval = (
+            self.layer_selection_reuse_interval
+        )
+        self._context_adaptive_layer_selection_reuse_active = False
+        self._active_selection_graph_capacity = None
+        self._last_superpage_certified = None
+        self._last_superpage_candidate_group_count = 0
+        self._invalidate_decode_selection_cache()
+        self._lazy_page_update_active = False
+        super().begin_dense_forward(forward_batch)
+
     @staticmethod
     def _host_int_tuple(value, expected_size: int) -> tuple[int, ...] | None:
         if torch.is_tensor(value):

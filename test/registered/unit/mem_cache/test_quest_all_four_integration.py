@@ -195,6 +195,121 @@ class TestExpectedFALengths(unittest.TestCase):
     "NVIDIA CUDA is required",
 )
 class TestQuestAllFourIntegration(unittest.TestCase):
+    def test_eager_dense_fallback_preserves_fa_metadata_and_page_tracking(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        page_size = 4
+        seq_lens = torch.tensor([32, 28], dtype=torch.int64, device=device)
+        req_pool_indices = torch.arange(2, dtype=torch.int64, device=device)
+        req_to_token, key_buffer = _build_storage(
+            seq_lens, page_size, device, seed=211, dtype=torch.float16
+        )
+        algorithm = _make_algorithm(
+            seq_lens=seq_lens,
+            page_size=page_size,
+            sparsity_ratio=0.4,
+            num_recent_pages=2,
+            req_to_token=req_to_token,
+            key_buffer=key_buffer,
+            extra_config={
+                **_all_four_config(use_native_page_bounds_dtype=True),
+                "dense_fallback_max_seq_len": 32,
+            },
+        )
+        algorithm.states.repr_constructed.fill_(True)
+        algorithm.states.last_constructed_page.copy_(seq_lens // page_size - 1)
+        forward_batch = _ForwardBatch(seq_lens, req_pool_indices)
+
+        max_pages = int((seq_lens.max().item() + page_size - 1) // page_size)
+        metadata = _make_metadata(2, max_pages, device)
+        page_starts = (
+            torch.arange(max_pages, dtype=torch.int64, device=device) * page_size
+        )
+        metadata.page_table.copy_(
+            torch.div(
+                req_to_token[req_pool_indices.unsqueeze(1), page_starts.unsqueeze(0)],
+                page_size,
+                rounding_mode="floor",
+            ).to(torch.int32)
+        )
+        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        metadata.cu_seqlens_k[0].zero_()
+        metadata.cu_seqlens_k[1:].copy_(seq_lens.cumsum(0, dtype=torch.int32))
+        metadata.max_seq_len_k = int(seq_lens.max().item())
+        metadata.scheduler_metadata = torch.ones(1, dtype=torch.int32, device=device)
+        metadata_ptrs = (
+            metadata.page_table.data_ptr(),
+            metadata.cache_seqlens_int32.data_ptr(),
+            metadata.cu_seqlens_k.data_ptr(),
+        )
+        metadata_snapshot = (
+            metadata.page_table.clone(),
+            metadata.cache_seqlens_int32.clone(),
+            metadata.cu_seqlens_k.clone(),
+            metadata.scheduler_metadata,
+        )
+
+        adaptor = FlashAttentionAdaptor(device)
+        coordinator = object.__new__(SparseCoordinator)
+        coordinator.config = algorithm.config
+        coordinator.algorithm = algorithm
+        coordinator.backend_adaptor = adaptor
+        coordinator.req_to_token_pool = algorithm.req_to_token_pool
+        coordinator.token_to_kv_pool = algorithm.token_to_kv_pool
+        coordinator.states = algorithm.states
+        coordinator.start_layer = 0
+        coordinator.end_layer = _END_LAYER
+        coordinator.device = device
+        coordinator.page_size = page_size
+        coordinator._forward_sparse_mask = None
+        coordinator._forward_dense_fallback = False
+        coordinator._last_sparse_layer_id = None
+        coordinator._forward_started = False
+
+        query = torch.zeros((2, 1, 8), dtype=torch.float16, device=device)
+        with patch.object(
+            coordinator,
+            "_handle_sparse_retrieve",
+            side_effect=AssertionError("dense fallback ran Quest retrieval"),
+        ) as sparse_retrieve, patch.object(
+            adaptor, "save_original_metadata", wraps=adaptor.save_original_metadata
+        ) as save_metadata:
+            for layer_id in range(_END_LAYER):
+                layer = SimpleNamespace(layer_id=layer_id)
+                self.assertIs(
+                    coordinator.attention_begin(
+                        query,
+                        query,
+                        query,
+                        layer,
+                        forward_batch,
+                        metadata,
+                    ),
+                    metadata,
+                )
+                coordinator.attention_end(query, layer, forward_batch)
+            coordinator.finalize_forward(forward_batch)
+
+        sparse_retrieve.assert_not_called()
+        save_metadata.assert_not_called()
+        self.assertEqual(
+            metadata_ptrs,
+            (
+                metadata.page_table.data_ptr(),
+                metadata.cache_seqlens_int32.data_ptr(),
+                metadata.cu_seqlens_k.data_ptr(),
+            ),
+        )
+        torch.testing.assert_close(metadata.page_table, metadata_snapshot[0])
+        torch.testing.assert_close(metadata.cache_seqlens_int32, metadata_snapshot[1])
+        torch.testing.assert_close(metadata.cu_seqlens_k, metadata_snapshot[2])
+        self.assertIs(metadata.scheduler_metadata, metadata_snapshot[3])
+        torch.testing.assert_close(
+            algorithm.states.last_constructed_page,
+            seq_lens // page_size,
+            rtol=0,
+            atol=0,
+        )
+
     def test_eager_all_four_matches_exact_reference_across_budget_boundaries(self):
         from sglang.jit_kernel.quest.topk import (
             quest_topk_to_flashattention_metadata_out,

@@ -33,6 +33,7 @@ QUEST_CONTEXT_ADAPTIVE_LAYER_SELECTION_REUSE_MIN_PAGES_OPTION = (
 )
 QUEST_SUPERPAGE_SIZE_OPTION = "quest_superpage_size"
 QUEST_SUPERPAGE_OVERSAMPLE_OPTION = "quest_superpage_oversample"
+QUEST_DENSE_FALLBACK_MAX_SEQ_LEN_OPTION = "dense_fallback_max_seq_len"
 
 
 def _load_hisparse_config(server_args: ServerArgs) -> dict:

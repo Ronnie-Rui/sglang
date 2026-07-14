@@ -747,6 +747,66 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, option):
                     parse_runtime_sparse_config(server_args)
 
+    def test_quest_runtime_dense_fallback_defaults_disabled(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            attention_backend="fa3",
+            page_size=16,
+            hisparse_config='{"algorithm":"quest","backend":"fa3","page_size":16}',
+        )
+
+        config = parse_runtime_sparse_config(server_args)
+
+        self.assertNotIn("dense_fallback_max_seq_len", config.sparse_extra_config)
+
+    def test_quest_runtime_accepts_dense_fallback_max_seq_len(self):
+        for threshold in (0, 8192, 10240):
+            with self.subTest(threshold=threshold):
+                hisparse_config = {
+                    "algorithm": "quest",
+                    "backend": "fa3",
+                    "page_size": 16,
+                    "dense_fallback_max_seq_len": threshold,
+                }
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=json.dumps(hisparse_config),
+                )
+
+                config = parse_runtime_sparse_config(server_args)
+
+                self.assertEqual(
+                    config.sparse_extra_config["dense_fallback_max_seq_len"],
+                    threshold,
+                )
+
+    def test_quest_runtime_rejects_invalid_dense_fallback_max_seq_len(self):
+        for threshold in (None, True, False, 8192.0, "8192", -1):
+            with self.subTest(threshold=threshold):
+                hisparse_config = {
+                    "algorithm": "quest",
+                    "backend": "fa3",
+                    "page_size": 16,
+                    "dense_fallback_max_seq_len": threshold,
+                }
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    attention_backend="fa3",
+                    page_size=16,
+                    hisparse_config=json.dumps(hisparse_config),
+                )
+
+                with self.assertRaisesRegex(ValueError, "dense_fallback_max_seq_len"):
+                    parse_runtime_sparse_config(server_args)
+
     def test_quest_runtime_validates_layer_page_budget(self):
         invalid_budgets = (
             '"not-a-list"',
