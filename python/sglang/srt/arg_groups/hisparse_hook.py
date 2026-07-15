@@ -20,6 +20,7 @@ RUNTIME_SPARSE_BACKENDS_BY_ALGORITHM = {
 }
 RUNTIME_SPARSE_ALGORITHMS = set(RUNTIME_SPARSE_BACKENDS_BY_ALGORITHM)
 RUNTIME_SPARSE_ATTENTION_BACKEND_ALIASES = {"flashattention": "fa3"}
+QUEST_MAX_SELECTED_TOKENS_OPTION = "quest_max_selected_tokens"
 
 
 def _load_hisparse_config(server_args: ServerArgs) -> dict:
@@ -198,7 +199,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
 
         model_config = server_args.get_model_config()
         if model_config.attention_arch != AttentionArch.MHA:
-            raise ValueError(f"{subject} currently supports standard MHA/GQA models only.")
+            raise ValueError(
+                f"{subject} currently supports standard MHA/GQA models only."
+            )
         if model_config.is_encoder_decoder:
             raise ValueError(f"{subject} does not support encoder-decoder models.")
         if model_config.is_multimodal:
@@ -206,7 +209,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         if not model_config.is_generation:
             raise ValueError(f"{subject} is only supported for generation models.")
         if model_config.num_attention_layers != model_config.num_hidden_layers:
-            raise ValueError(f"{subject} requires one attention layer per hidden layer.")
+            raise ValueError(
+                f"{subject} requires one attention layer per hidden layer."
+            )
         sliding_window_size = model_config.sliding_window_size
         has_sliding_window = isinstance(sliding_window_size, (int, float)) and (
             sliding_window_size > -1
@@ -263,9 +268,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert (
-        server_args.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+    assert server_args.disable_radix_cache, (
+        "Hierarchical sparse attention currently requires --disable-radix-cache."
+    )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

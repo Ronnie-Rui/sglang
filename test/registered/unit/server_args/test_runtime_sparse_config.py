@@ -136,6 +136,38 @@ class TestRuntimeSparseConfig(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, message):
                 self._parse(config)
 
+    def test_accepts_page_aligned_selected_token_cap(self):
+        config = self._parse(
+            {
+                "algorithm": "quest",
+                "backend": "fa3",
+                "page_size": 16,
+                "num_recent_pages": 4,
+                "quest_max_selected_tokens": 1024,
+            }
+        )
+
+        self.assertEqual(config.sparse_extra_config["quest_max_selected_tokens"], 1024)
+
+    def test_rejects_invalid_selected_token_cap(self):
+        invalid = (
+            (True, "positive integer or null"),
+            (0, "positive integer or null"),
+            (81, "multiple of page_size"),
+            (64, "all recent pages and at least one history page"),
+        )
+        for value, message in invalid:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, message):
+                self._parse(
+                    {
+                        "algorithm": "quest",
+                        "backend": "fa3",
+                        "page_size": 16,
+                        "num_recent_pages": 4,
+                        "quest_max_selected_tokens": value,
+                    }
+                )
+
 
 class TestRuntimeSparseCudaGraphDefaults(unittest.TestCase):
     def test_unlocked_defaults_use_breakable_decode_and_disable_prefill(self):

@@ -343,6 +343,64 @@ def test_layer_reuse_updates_only_actual_anchors_and_advances_final_group():
     assert algorithm.states.last_constructed_page.tolist() == [2]
 
 
+def _capped_plan(*, seq_lens_cpu=True, fixed_capacity=False, layer_budget=None):
+    algorithm = QuestAlgorithm(
+        _config(
+            quest_max_selected_tokens=48,
+            layer_page_budget=layer_budget or [],
+        ),
+        torch.device("cpu"),
+    )
+    algorithm.start_layer = 0
+    algorithm.end_layer = 2
+    algorithm.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.arange(400, dtype=torch.int64).unsqueeze(0),
+        max_context_len=400,
+    )
+    forward_batch = SimpleNamespace(seq_lens=torch.tensor([400]))
+    if seq_lens_cpu:
+        forward_batch.seq_lens_cpu = [400]
+    algorithm.begin_forward(
+        forward_batch,
+        torch.tensor([0]),
+        torch.tensor([True]),
+        torch.device("cpu"),
+        fixed_capacity=fixed_capacity,
+    )
+    return algorithm
+
+
+def test_selected_token_cap_is_default_off_and_caps_host_device_and_graph_plans():
+    assert (
+        QuestAlgorithm(_config(), torch.device("cpu")).quest_max_selected_pages is None
+    )
+
+    host = _capped_plan()
+    device_only = _capped_plan(seq_lens_cpu=False)
+    fixed = _capped_plan(fixed_capacity=100)
+
+    assert host.quest_max_selected_pages == 12
+    assert host.get_history_page_selection_cap() == 10
+    for algorithm in (host, device_only, fixed):
+        assert algorithm._retrieval_plan.k_per_req.tolist() == [10]
+        assert algorithm._retrieval_plan.max_k == 10
+        assert algorithm._retrieval_plan.max_k + algorithm.num_recent_pages == 12
+
+
+def test_layer_ratio_is_applied_before_global_selected_token_cap():
+    algorithm = _capped_plan(
+        layer_budget=[{"start_layer": 1, "end_layer": 2, "scale": 0.1}]
+    )
+    base_plan = algorithm._retrieval_plan
+    layer_plan = algorithm._get_retrieval_plan_for_ratio(
+        base_plan, algorithm.get_layer_sparsity_ratio(1)
+    )
+
+    assert base_plan.k_per_req.tolist() == [10]
+    assert layer_plan.k_per_req.tolist() == [4]
+    assert [base_plan.max_k, layer_plan.max_k] == [10, 4]
+
+
 def test_full_page_fast_path_and_partial_fallback_match_reference():
     algorithm = QuestAlgorithm(_config(), torch.device("cpu"))
     algorithm.req_to_token_pool = SimpleNamespace(
