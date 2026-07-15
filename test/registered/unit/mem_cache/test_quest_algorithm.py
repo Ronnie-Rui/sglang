@@ -63,6 +63,19 @@ def _build_plan(page_counts, sparse_mask, *, sparsity_ratio=0.25):
     return algorithm, plan
 
 
+def _layer_policy_algorithm(*, interval=1, layer_page_budget=None):
+    algorithm = QuestAlgorithm(
+        _config(
+            layer_selection_reuse_interval=interval,
+            layer_page_budget=layer_page_budget or [],
+        ),
+        torch.device("cpu"),
+    )
+    algorithm.start_layer = 0
+    algorithm.end_layer = 5
+    return algorithm
+
+
 def test_batched_retrieval_matches_per_request_reference():
     algorithm = _ScoreAlgorithm(_config(), torch.device("cpu"))
     req_to_token = torch.arange(64, dtype=torch.int64).repeat(4, 1)
@@ -227,6 +240,107 @@ def test_non_cpu_sparse_mask_never_forces_a_host_copy():
         2,
         forward_batch=SimpleNamespace(sparse_mask_cpu=[False, True]),
     ) == [False, True]
+
+
+def test_layer_policy_reuses_only_consecutive_layers_with_matching_budget():
+    algorithm = _layer_policy_algorithm(
+        interval=4,
+        layer_page_budget=[{"start_layer": 2, "end_layer": 4, "scale": 0.5}],
+    )
+    selected = torch.tensor([[7]], dtype=torch.int32)
+    lengths = torch.tensor([1], dtype=torch.int32)
+
+    with patch.object(
+        BaseSparseAlgorithmImpl,
+        "retrieve_topk",
+        return_value=(selected, lengths),
+    ) as underlying:
+        results = [
+            algorithm.retrieve_topk(
+                torch.zeros((1, 1, 1)),
+                layer_id,
+                torch.zeros(1, dtype=torch.long),
+                torch.ones(1, dtype=torch.bool),
+                forward_batch=object(),
+            )
+            for layer_id in range(5)
+        ]
+
+    assert underlying.call_count == 3
+    assert [len(result) for result in results] == [2, 3, 2, 3, 2]
+    assert [algorithm.should_update_metadata_lengths(i) for i in range(5)] == [
+        True,
+        False,
+        True,
+        False,
+        True,
+    ]
+
+
+def test_layer_budget_builds_and_caches_ratio_specific_plan():
+    algorithm = _layer_policy_algorithm(
+        layer_page_budget=[{"start_layer": 1, "end_layer": 2, "scale": 0.5}],
+    )
+    algorithm.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.arange(400, dtype=torch.int64).unsqueeze(0),
+        max_context_len=400,
+    )
+    forward_batch = SimpleNamespace(seq_lens=torch.tensor([400]), seq_lens_cpu=[400])
+    algorithm.begin_forward(
+        forward_batch,
+        torch.tensor([0]),
+        torch.tensor([True]),
+        torch.device("cpu"),
+    )
+
+    base_plan = algorithm._retrieval_plan
+    budget_plan = algorithm._get_retrieval_plan_for_ratio(
+        base_plan, algorithm.get_layer_sparsity_ratio(1)
+    )
+
+    assert base_plan.k_per_req.tolist() == [49]
+    assert budget_plan.k_per_req.tolist() == [24]
+    assert budget_plan.max_k == 24
+    assert budget_plan.physical_pages.data_ptr() == base_plan.physical_pages.data_ptr()
+    assert (
+        algorithm._get_retrieval_plan_for_ratio(
+            base_plan, algorithm.get_layer_sparsity_ratio(1)
+        )
+        is budget_plan
+    )
+
+
+def test_layer_reuse_updates_only_actual_anchors_and_advances_final_group():
+    algorithm = _layer_policy_algorithm(interval=2)
+    algorithm.end_layer = 4
+    algorithm.states = SimpleNamespace(
+        repr_constructed=torch.tensor([True]),
+        last_constructed_page=torch.tensor([1]),
+    )
+    algorithm._actual_selection_anchors.update({0, 2})
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode=lambda: True),
+    )
+    req_pool_indices = torch.tensor([0])
+    seq_lens = torch.tensor([8])
+    k_buffer = torch.zeros((8, 1, 1))
+
+    with (
+        patch.object(algorithm, "should_update_representations", return_value=True),
+        patch.object(algorithm, "_compute_page_representations") as compute,
+    ):
+        for layer_id in range(4):
+            algorithm.update_representations(
+                layer_id,
+                req_pool_indices,
+                seq_lens,
+                k_buffer,
+                forward_batch,
+            )
+
+    assert [call.args[0] for call in compute.call_args_list] == [0, 2]
+    assert algorithm.states.repr_constructed.tolist() == [True]
+    assert algorithm.states.last_constructed_page.tolist() == [2]
 
 
 def test_full_page_fast_path_and_partial_fallback_match_reference():

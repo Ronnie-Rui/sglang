@@ -175,9 +175,7 @@ class SparseCoordinator:
         if torch.is_tensor(seq_lens_cpu):
             if seq_lens_cpu.device.type != "cpu":
                 return self.cuda_graph_page_buckets[-1]
-            max_seq_len = (
-                int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() else 0
-            )
+            max_seq_len = int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() else 0
         else:
             try:
                 max_seq_len = max((int(value) for value in seq_lens_cpu), default=0)
@@ -341,6 +339,9 @@ class SparseCoordinator:
         sparse_mask = self._forward_sparse_mask
         if sparse_mask is None:
             sparse_mask = self._compute_sparse_mask(req_pool_indices)
+        update_metadata_lengths = self.algorithm.should_update_metadata_lengths(
+            layer_id
+        )
         retrieval_result = self.algorithm.retrieve_topk(
             queries=query,
             layer_id=layer_id,
@@ -373,9 +374,7 @@ class SparseCoordinator:
             layer_id=layer_id,
             selected_physical_indices=selected_physical_indices,
             metadata_prepared=metadata_prepared,
-            update_metadata_lengths=self.algorithm.should_update_metadata_lengths(
-                layer_id
-            ),
+            update_metadata_lengths=update_metadata_lengths,
         )
 
     def _compute_sparse_mask(self, req_pool_indices):

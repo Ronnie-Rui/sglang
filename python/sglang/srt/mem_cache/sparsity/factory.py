@@ -194,6 +194,74 @@ def parse_runtime_sparse_config(server_args) -> SparseConfig:
             f"got {num_recent_pages!r}."
         )
 
+    layer_selection_reuse_interval = config.sparse_extra_config.get(
+        "layer_selection_reuse_interval"
+    )
+    if layer_selection_reuse_interval is not None and (
+        not isinstance(layer_selection_reuse_interval, int)
+        or isinstance(layer_selection_reuse_interval, bool)
+        or layer_selection_reuse_interval <= 0
+    ):
+        raise ValueError(
+            "Sparse runtime config layer_selection_reuse_interval must be a "
+            "positive integer, "
+            f"got {layer_selection_reuse_interval!r}."
+        )
+
+    layer_page_budget = config.sparse_extra_config.get("layer_page_budget")
+    if layer_page_budget is not None:
+        if not isinstance(layer_page_budget, list):
+            raise ValueError(
+                "Sparse runtime config layer_page_budget must be a list, "
+                f"got {layer_page_budget!r}."
+            )
+
+        normalized_ranges = []
+        required_keys = {"start_layer", "end_layer", "scale"}
+        for index, budget_range in enumerate(layer_page_budget):
+            if not isinstance(budget_range, dict) or set(budget_range) != required_keys:
+                raise ValueError(
+                    "Each layer_page_budget entry must be an object with exactly "
+                    "start_layer, end_layer, and scale; "
+                    f"entry {index} is {budget_range!r}."
+                )
+
+            start_layer = budget_range["start_layer"]
+            end_layer = budget_range["end_layer"]
+            scale = budget_range["scale"]
+            if (
+                not isinstance(start_layer, int)
+                or isinstance(start_layer, bool)
+                or start_layer < 0
+                or not isinstance(end_layer, int)
+                or isinstance(end_layer, bool)
+                or end_layer <= start_layer
+            ):
+                raise ValueError(
+                    "layer_page_budget ranges must use non-negative, half-open "
+                    "integer layer bounds with end_layer > start_layer; "
+                    f"entry {index} is {budget_range!r}."
+                )
+            if (
+                not isinstance(scale, (int, float))
+                or isinstance(scale, bool)
+                or not 0 < scale <= 1
+            ):
+                raise ValueError(
+                    "layer_page_budget scale must be in the range (0, 1], "
+                    f"got {scale!r} in entry {index}."
+                )
+            normalized_ranges.append((start_layer, end_layer))
+
+        normalized_ranges.sort()
+        for previous, current in zip(normalized_ranges, normalized_ranges[1:]):
+            if current[0] < previous[1]:
+                raise ValueError(
+                    "layer_page_budget ranges must not overlap, "
+                    f"got [{previous[0]}, {previous[1]}) and "
+                    f"[{current[0]}, {current[1]})."
+                )
+
     boolean_options = (
         "use_triton_score_kernel",
         "use_fused_score_mask_kernel",

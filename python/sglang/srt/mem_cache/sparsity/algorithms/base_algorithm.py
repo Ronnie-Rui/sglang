@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from ctypes import c_float
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,6 +27,7 @@ class _RetrievalPlan:
     seq_lens_cpu: list[int] | None
     req_pool_indices: torch.Tensor
     sparse_mask: torch.Tensor
+    sparse_mask_cpu: list[bool] | None
     num_pages: torch.Tensor
     num_pages_cpu: list[int] | None
     max_num_pages: int
@@ -85,6 +86,9 @@ class BaseSparseAlgorithm(ABC):
 
     def should_finalize_graph_forward(self, forward_batch: "ForwardBatch") -> bool:
         return False
+
+    def get_layer_sparsity_ratio(self, layer_id: int) -> float:
+        return self.sparsity_ratio
 
     def should_update_metadata_lengths(self, layer_id: int) -> bool:
         return layer_id == getattr(self, "start_layer", layer_id)
@@ -231,6 +235,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         self.num_recent_pages = config.sparse_extra_config.get("num_recent_pages", 4)
         self.page_size = config.page_size
         self._retrieval_plan: _RetrievalPlan | None = None
+        self._retrieval_plans_by_ratio: dict[float, _RetrievalPlan] = {}
         self._representation_update_batch = None
         self._representation_update_due: bool | None = None
 
@@ -242,6 +247,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         device: torch.device,
         fixed_capacity: bool | int = False,
     ) -> None:
+        self._retrieval_plans_by_ratio.clear()
         self._representation_update_batch = forward_batch
         if self.req_to_token_pool is None:
             self._retrieval_plan = None
@@ -256,6 +262,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             device,
             fixed_capacity=fixed_capacity,
         )
+        self._retrieval_plans_by_ratio[self.sparsity_ratio] = self._retrieval_plan
         self._representation_update_due = self._has_completed_page(
             self._retrieval_plan.seq_lens_cpu
         )
@@ -442,6 +449,10 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
                 device,
             )
             self._retrieval_plan = plan
+            self._retrieval_plans_by_ratio = {self.sparsity_ratio: plan}
+        plan = self._get_retrieval_plan_for_ratio(
+            plan, self.get_layer_sparsity_ratio(layer_id)
+        )
         if plan.max_num_pages <= self.num_recent_pages or plan.max_k <= 0:
             return self._empty_retrieval(bs, device)
 
@@ -642,7 +653,9 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         batch_size = req_pool_indices.numel()
         seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.long)
         seq_lens_cpu = (
-            None if fixed_capacity else self._get_seq_lens_cpu(forward_batch, batch_size)
+            None
+            if fixed_capacity
+            else self._get_seq_lens_cpu(forward_batch, batch_size)
         )
         req_pool_indices = req_pool_indices.to(device=device, dtype=torch.long)
         sparse_mask_source = sparse_mask
@@ -710,57 +723,15 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         active_mask = sparse_mask & (num_pages > self.num_recent_pages)
         recent_start = (num_pages - self.num_recent_pages).clamp(min=0)
         history_page_mask = page_idx.unsqueeze(0) < recent_start.unsqueeze(1)
-        history_pages = recent_start.clamp(min=1)
-        k_per_req = (history_pages.to(torch.float32) * self.sparsity_ratio).to(
-            torch.int32
+        k_per_req, max_k, score_order_required = self._build_selection_budget(
+            active_mask=active_mask,
+            recent_start=recent_start,
+            num_pages_cpu=num_pages_cpu,
+            sparse_mask_cpu=sparse_mask_cpu,
+            max_num_pages=max_num_pages,
+            fixed_capacity=bool(fixed_capacity),
+            ratio=self.sparsity_ratio,
         )
-        k_per_req = torch.maximum(k_per_req, torch.ones_like(k_per_req))
-        k_per_req = torch.minimum(k_per_req, history_pages.to(torch.int32))
-        k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
-
-        if fixed_capacity:
-            history_capacity = max(max_num_pages - self.num_recent_pages, 0)
-            max_k = (
-                min(
-                    max(
-                        _float32_scaled_count(history_capacity, self.sparsity_ratio),
-                        1,
-                    ),
-                    history_capacity,
-                )
-                if history_capacity > 0
-                else 0
-            )
-            score_order_required = True
-        elif num_pages_cpu is not None:
-            k_per_req_cpu = []
-            for row, count in enumerate(num_pages_cpu):
-                # Without an existing host mask, size the output conservatively.
-                # The device k_per_req remains authoritative and zeros inactive
-                # rows. PR2's forward plan can provide/cache sparse_mask_cpu.
-                is_sparse = (
-                    sparse_mask_cpu[row] if sparse_mask_cpu is not None else True
-                )
-                history_count = max(count - self.num_recent_pages, 0)
-                k_per_req_cpu.append(
-                    min(
-                        max(
-                            _float32_scaled_count(
-                                max(history_count, 1), self.sparsity_ratio
-                            ),
-                            1,
-                        ),
-                        history_count,
-                    )
-                    if is_sparse and history_count > 0
-                    else 0
-                )
-            max_k = max(k_per_req_cpu, default=0)
-            positive_k = {value for value in k_per_req_cpu if value > 0}
-            score_order_required = len(positive_k) > 1
-        else:
-            max_k = int(k_per_req.max().item()) if batch_size > 0 else 0
-            score_order_required = True
 
         recent_offsets = torch.arange(
             self.num_recent_pages, device=device, dtype=torch.long
@@ -780,6 +751,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             seq_lens_cpu=seq_lens_cpu,
             req_pool_indices=req_pool_indices,
             sparse_mask=sparse_mask,
+            sparse_mask_cpu=sparse_mask_cpu,
             num_pages=num_pages,
             num_pages_cpu=num_pages_cpu,
             max_num_pages=max_num_pages,
@@ -797,6 +769,89 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             recent_valid=recent_valid,
             fixed_capacity=bool(fixed_capacity),
         )
+
+    def _build_selection_budget(
+        self,
+        *,
+        active_mask: torch.Tensor,
+        recent_start: torch.Tensor,
+        num_pages_cpu: list[int] | None,
+        sparse_mask_cpu: list[bool] | None,
+        max_num_pages: int,
+        fixed_capacity: bool,
+        ratio: float,
+    ) -> tuple[torch.Tensor, int, bool]:
+        history_pages = recent_start.clamp(min=1)
+        k_per_req = (history_pages.to(torch.float32) * ratio).to(torch.int32)
+        k_per_req = torch.maximum(k_per_req, torch.ones_like(k_per_req))
+        k_per_req = torch.minimum(k_per_req, history_pages.to(torch.int32))
+        k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
+
+        if fixed_capacity:
+            history_capacity = max(max_num_pages - self.num_recent_pages, 0)
+            max_k = (
+                min(
+                    max(_float32_scaled_count(history_capacity, ratio), 1),
+                    history_capacity,
+                )
+                if history_capacity > 0
+                else 0
+            )
+            score_order_required = True
+        elif num_pages_cpu is not None:
+            k_per_req_cpu = []
+            for row, count in enumerate(num_pages_cpu):
+                is_sparse = (
+                    sparse_mask_cpu[row] if sparse_mask_cpu is not None else True
+                )
+                history_count = max(count - self.num_recent_pages, 0)
+                k_per_req_cpu.append(
+                    min(
+                        max(
+                            _float32_scaled_count(max(history_count, 1), ratio),
+                            1,
+                        ),
+                        history_count,
+                    )
+                    if is_sparse and history_count > 0
+                    else 0
+                )
+            max_k = max(k_per_req_cpu, default=0)
+            positive_k = {value for value in k_per_req_cpu if value > 0}
+            score_order_required = len(positive_k) > 1
+        else:
+            max_k = int(k_per_req.max().item()) if k_per_req.numel() > 0 else 0
+            score_order_required = True
+
+        return k_per_req, max_k, score_order_required
+
+    def _get_retrieval_plan_for_ratio(
+        self, plan: _RetrievalPlan, ratio: float
+    ) -> _RetrievalPlan:
+        if ratio == self.sparsity_ratio:
+            return plan
+
+        cached_plan = self._retrieval_plans_by_ratio.get(ratio)
+        if cached_plan is not None:
+            return cached_plan
+
+        k_per_req, max_k, score_order_required = self._build_selection_budget(
+            active_mask=plan.active_mask,
+            recent_start=plan.recent_start,
+            num_pages_cpu=plan.num_pages_cpu,
+            sparse_mask_cpu=plan.sparse_mask_cpu,
+            max_num_pages=plan.max_num_pages,
+            fixed_capacity=plan.fixed_capacity,
+            ratio=ratio,
+        )
+        cached_plan = replace(
+            plan,
+            k_per_req=k_per_req,
+            max_k=max_k,
+            score_order_required=score_order_required,
+        )
+        self._retrieval_plans_by_ratio[ratio] = cached_plan
+        return cached_plan
 
     @staticmethod
     def _get_bool_mask_cpu(
@@ -834,8 +889,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if values is None:
             return None
         return [
-            max((value + self.page_size - 1) // self.page_size, 0)
-            for value in values
+            max((value + self.page_size - 1) // self.page_size, 0) for value in values
         ]
 
     @staticmethod
@@ -892,8 +946,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if seq_lens_cpu is None:
             return None
         return any(
-            seq_len > 0 and seq_len % self.page_size == 0
-            for seq_len in seq_lens_cpu
+            seq_len > 0 and seq_len % self.page_size == 0 for seq_len in seq_lens_cpu
         )
 
     @staticmethod

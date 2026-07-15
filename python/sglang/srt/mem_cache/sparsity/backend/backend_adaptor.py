@@ -142,11 +142,15 @@ class FlashAttentionAdaptor(BackendAdaptor):
 
         max_selected = selected_indices.shape[1]
         metadata_prepared = bool(kwargs.get("metadata_prepared", False))
+        update_metadata_lengths = bool(
+            kwargs.get("update_metadata_lengths", not self._metadata_prepared)
+        )
         if metadata_prepared:
-            if not self._metadata_prepared:
+            if not self._metadata_prepared or update_metadata_lengths:
                 self._max_selected = max_selected
                 self._valid_lengths = valid_lengths
                 current_metadata.max_seq_len_k = max(
+                    current_metadata.max_seq_len_k,
                     self._original_metadata["max_seq_len_k"],
                     max_selected * page_size,
                 )
@@ -160,25 +164,26 @@ class FlashAttentionAdaptor(BackendAdaptor):
                 )
             return current_metadata
 
-        use_triton_metadata_kernel = all(
-            tensor.is_cuda
-            for tensor in (
-                selected_indices,
-                valid_lengths,
-                sparse_mask,
-                forward_batch.seq_lens,
-                forward_batch.req_pool_indices,
-                req_to_token,
-                current_metadata.page_table,
-                current_metadata.cache_seqlens_int32,
-                current_metadata.cu_seqlens_k,
+        use_triton_metadata_kernel = (
+            all(
+                tensor.is_cuda
+                for tensor in (
+                    selected_indices,
+                    valid_lengths,
+                    sparse_mask,
+                    forward_batch.seq_lens,
+                    forward_batch.req_pool_indices,
+                    req_to_token,
+                    current_metadata.page_table,
+                    current_metadata.cache_seqlens_int32,
+                    current_metadata.cu_seqlens_k,
+                )
             )
-        ) and torch.version.hip is None
+            and torch.version.hip is None
+        )
         if use_triton_metadata_kernel:
-            update_lengths = bool(
-                kwargs.get("update_metadata_lengths", not self._metadata_prepared)
-            ) and not self._metadata_prepared
-            if not self._metadata_prepared:
+            update_lengths = not self._metadata_prepared or update_metadata_lengths
+            if update_lengths:
                 self._max_selected = max_selected
                 self._valid_lengths = valid_lengths
             elif max_selected != self._max_selected:
@@ -202,8 +207,9 @@ class FlashAttentionAdaptor(BackendAdaptor):
                 update_lengths=update_lengths,
                 selected_indices_are_physical=False,
             )
-            if not self._metadata_prepared:
+            if update_lengths:
                 current_metadata.max_seq_len_k = max(
+                    current_metadata.max_seq_len_k,
                     self._original_metadata["max_seq_len_k"],
                     max_selected * page_size,
                 )
@@ -219,12 +225,12 @@ class FlashAttentionAdaptor(BackendAdaptor):
                 page_size,
             )
         max_selected = physical_pages.shape[1]
-        if not self._metadata_prepared:
+        update_lengths = not self._metadata_prepared or update_metadata_lengths
+        if update_lengths:
             active_sparse_mask = sparse_mask & (valid_lengths > 0)
-            valid_mask = (
-                torch.arange(max_selected, device=physical_pages.device).unsqueeze(0)
-                < valid_lengths.unsqueeze(1)
-            )
+            valid_mask = torch.arange(
+                max_selected, device=physical_pages.device
+            ).unsqueeze(0) < valid_lengths.unsqueeze(1)
             self._page_table_update_mask = active_sparse_mask.unsqueeze(1) & valid_mask
             self._max_selected = max_selected
             self._valid_lengths = valid_lengths
@@ -250,6 +256,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
                 )
             )
             current_metadata.max_seq_len_k = max(
+                current_metadata.max_seq_len_k,
                 self._original_metadata["max_seq_len_k"],
                 max_selected * page_size,
             )

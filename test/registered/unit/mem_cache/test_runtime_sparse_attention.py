@@ -129,6 +129,49 @@ class TestFlashAttentionAdaptor(unittest.TestCase):
 
         self.assertEqual(metadata.page_table.tolist(), [[7, 3]])
 
+    def test_budget_change_rewrites_lengths_again_with_new_width(self):
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[0, 1]], dtype=torch.int32),
+            cache_seqlens_int32=torch.tensor([8], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 8], dtype=torch.int32),
+            max_seq_len_k=8,
+            scheduler_metadata=None,
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([8]),
+        )
+        req_to_token = torch.arange(8).view(1, 8)
+        self.adaptor.save_original_metadata(metadata)
+
+        self.adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor([[0]], dtype=torch.int32),
+            valid_lengths=torch.tensor([1], dtype=torch.int32),
+            sparse_mask=torch.tensor([True]),
+            current_metadata=metadata,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=0,
+            update_metadata_lengths=True,
+        )
+        self.assertEqual(metadata.cache_seqlens_int32.tolist(), [4])
+
+        self.adaptor.adapt_for_attn_metadata(
+            selected_indices=torch.tensor([[0, 1]], dtype=torch.int32),
+            valid_lengths=torch.tensor([2], dtype=torch.int32),
+            sparse_mask=torch.tensor([True]),
+            current_metadata=metadata,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            page_size=4,
+            layer_id=1,
+            update_metadata_lengths=True,
+        )
+        self.assertEqual(metadata.page_table.tolist(), [[0, 1]])
+        self.assertEqual(metadata.cache_seqlens_int32.tolist(), [8])
+        self.assertEqual(metadata.cu_seqlens_k.tolist(), [0, 8])
+
     def test_new_forward_resets_layer_invariant_state(self):
         self.adaptor.save_original_metadata(self.metadata)
         self.adaptor.adapt_for_attn_metadata(

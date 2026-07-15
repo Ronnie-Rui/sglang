@@ -80,6 +80,62 @@ class TestRuntimeSparseConfig(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, message):
                 self._parse(config)
 
+    def test_accepts_layer_reuse_and_non_overlapping_page_budgets(self):
+        config = self._parse(
+            {
+                "algorithm": "quest",
+                "backend": "fa3",
+                "page_size": 16,
+                "layer_selection_reuse_interval": 2,
+                "layer_page_budget": [
+                    {"start_layer": 4, "end_layer": 20, "scale": 0.5},
+                    {"start_layer": 20, "end_layer": 28, "scale": 0.75},
+                ],
+            }
+        )
+
+        self.assertEqual(
+            config.sparse_extra_config["layer_selection_reuse_interval"], 2
+        )
+        self.assertEqual(len(config.sparse_extra_config["layer_page_budget"]), 2)
+
+    def test_rejects_invalid_layer_reuse_and_page_budgets(self):
+        invalid = (
+            ({"layer_selection_reuse_interval": True}, "layer_selection"),
+            ({"layer_selection_reuse_interval": 0}, "layer_selection"),
+            ({"layer_page_budget": "all"}, "layer_page_budget"),
+            (
+                {"layer_page_budget": [{"start_layer": 0, "end_layer": 4}]},
+                "exactly",
+            ),
+            (
+                {
+                    "layer_page_budget": [
+                        {"start_layer": 2, "end_layer": 2, "scale": 0.5}
+                    ]
+                },
+                "half-open",
+            ),
+            (
+                {
+                    "layer_page_budget": [
+                        {"start_layer": 0, "end_layer": 4, "scale": 0.5},
+                        {"start_layer": 3, "end_layer": 8, "scale": 0.75},
+                    ]
+                },
+                "must not overlap",
+            ),
+        )
+        for extra, message in invalid:
+            config = {
+                "algorithm": "quest",
+                "backend": "fa3",
+                "page_size": 16,
+                **extra,
+            }
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, message):
+                self._parse(config)
+
 
 class TestRuntimeSparseCudaGraphDefaults(unittest.TestCase):
     def test_unlocked_defaults_use_breakable_decode_and_disable_prefill(self):

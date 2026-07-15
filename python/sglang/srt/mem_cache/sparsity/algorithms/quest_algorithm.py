@@ -41,9 +41,123 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.use_lazy_page_update_score_kernel = config.sparse_extra_config.get(
             "use_lazy_page_update_score_kernel", False
         )
+        self.layer_selection_reuse_interval = config.sparse_extra_config.get(
+            "layer_selection_reuse_interval", 1
+        )
+        self.layer_page_budget = tuple(
+            (
+                budget_range["start_layer"],
+                budget_range["end_layer"],
+                float(budget_range["scale"]),
+            )
+            for budget_range in config.sparse_extra_config.get("layer_page_budget", ())
+        )
+        self._layer_policy_enabled = self.layer_selection_reuse_interval > 1 or bool(
+            self.layer_page_budget
+        )
+        self._selection_cache = None
+        self._selection_cache_group = None
+        self._selection_cache_layer = None
+        self._actual_selection_anchors = set()
+        self._metadata_length_updates = {}
+        self._last_metadata_layer = None
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
+
+    def begin_forward(self, *args, **kwargs) -> None:
+        self._selection_cache = None
+        self._selection_cache_group = None
+        self._selection_cache_layer = None
+        self._actual_selection_anchors.clear()
+        self._metadata_length_updates.clear()
+        self._last_metadata_layer = None
+        super().begin_forward(*args, **kwargs)
+
+    def _get_layer_budget_scale(self, layer_id: int) -> float:
+        for start_layer, end_layer, scale in self.layer_page_budget:
+            if start_layer <= layer_id < end_layer:
+                return scale
+        return 1.0
+
+    def get_layer_sparsity_ratio(self, layer_id: int) -> float:
+        return self.sparsity_ratio * self._get_layer_budget_scale(layer_id)
+
+    def _selection_group(self, layer_id: int) -> tuple[int, float]:
+        return (
+            (layer_id - self.start_layer) // self.layer_selection_reuse_interval,
+            self._get_layer_budget_scale(layer_id),
+        )
+
+    def _is_selection_anchor(self, layer_id: int) -> bool:
+        return layer_id == self.start_layer or self._selection_group(
+            layer_id
+        ) != self._selection_group(layer_id - 1)
+
+    def _is_actual_selection_anchor(self, layer_id: int) -> bool:
+        if self._actual_selection_anchors:
+            return layer_id in self._actual_selection_anchors
+        return self._is_selection_anchor(layer_id)
+
+    def _should_advance_layer_trackers(self, layer_id: int) -> bool:
+        return self._selection_group(layer_id) == self._selection_group(
+            self.end_layer - 1
+        )
+
+    def should_update_metadata_lengths(self, layer_id: int) -> bool:
+        if not self._layer_policy_enabled:
+            return super().should_update_metadata_lengths(layer_id)
+
+        cached = self._metadata_length_updates.get(layer_id)
+        if cached is not None:
+            return cached
+
+        previous_layer = self._last_metadata_layer
+        update_lengths = previous_layer is None or self._get_layer_budget_scale(
+            layer_id
+        ) != self._get_layer_budget_scale(previous_layer)
+        self._metadata_length_updates[layer_id] = update_lengths
+        self._last_metadata_layer = layer_id
+        return update_lengths
+
+    def retrieve_topk(
+        self,
+        queries: torch.Tensor,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        **kwargs,
+    ) -> tuple:
+        if not self._layer_policy_enabled:
+            return super().retrieve_topk(
+                queries, layer_id, req_pool_indices, sparse_mask, **kwargs
+            )
+
+        # Direct metadata finalization asks for this decision inside retrieval;
+        # the coordinator asks again afterwards. Cache one same-forward answer.
+        self.should_update_metadata_lengths(layer_id)
+        group = self._selection_group(layer_id)
+        previous_layer = self._selection_cache_layer
+        can_reuse = (
+            self._selection_cache is not None
+            and self._selection_cache_group == group
+            and previous_layer is not None
+            and layer_id == previous_layer + 1
+            and layer_id != self.start_layer
+        )
+        if can_reuse:
+            self._selection_cache_layer = layer_id
+            selected_indices, valid_lengths = self._selection_cache
+            return selected_indices, valid_lengths, True
+
+        self._actual_selection_anchors.add(layer_id)
+        result = super().retrieve_topk(
+            queries, layer_id, req_pool_indices, sparse_mask, **kwargs
+        )
+        self._selection_cache = result[:2]
+        self._selection_cache_group = group
+        self._selection_cache_layer = layer_id
+        return result
 
     def should_finalize_graph_forward(self, forward_batch) -> bool:
         plan = self._retrieval_plan
@@ -111,7 +225,18 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             return
         if not self.should_update_representations(forward_batch):
             return
+        if self._layer_policy_enabled and not self._is_actual_selection_anchor(
+            layer_id
+        ):
+            return
         if not self._can_use_triton_page_update(req_pool_indices, seq_lens, k_buffer):
+            if self._layer_policy_enabled:
+                return self._update_layer_representations_portable(
+                    layer_id,
+                    req_pool_indices,
+                    seq_lens,
+                    k_buffer,
+                )
             return super().update_representations(
                 layer_id,
                 req_pool_indices,
@@ -135,8 +260,43 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             self.page_k_max[layer_id],
             self.page_valid[layer_id],
             self.page_size,
-            advance_trackers=layer_id == self.end_layer - 1,
+            advance_trackers=(
+                self._should_advance_layer_trackers(layer_id)
+                if self._layer_policy_enabled
+                else layer_id == self.end_layer - 1
+            ),
         )
+
+    def _update_layer_representations_portable(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_buffer: torch.Tensor,
+    ) -> None:
+        end_page = seq_lens // self.page_size
+        constructed = self.states.repr_constructed[req_pool_indices]
+        start_page = torch.where(
+            constructed,
+            self.states.last_constructed_page[req_pool_indices],
+            torch.zeros_like(end_page),
+        )
+        valid_mask = start_page < end_page
+        if not valid_mask.any():
+            return
+
+        self._compute_page_representations(
+            layer_id,
+            req_pool_indices[valid_mask],
+            seq_lens[valid_mask],
+            start_page[valid_mask],
+            end_page[valid_mask],
+            k_buffer,
+        )
+        if self._should_advance_layer_trackers(layer_id):
+            success_indices = req_pool_indices[valid_mask]
+            self.states.repr_constructed[success_indices] = True
+            self.states.last_constructed_page[success_indices] = end_page[valid_mask]
 
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int
@@ -265,7 +425,11 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 page_size=self.page_size,
                 active_mask=plan.active_mask,
                 history_page_counts=plan.recent_start,
-                advance_trackers=layer_id == self.end_layer - 1,
+                advance_trackers=(
+                    self._should_advance_layer_trackers(layer_id)
+                    if self._layer_policy_enabled
+                    else layer_id == self.end_layer - 1
+                ),
             )
         if self.use_fused_score_mask_kernel and self._can_use_triton_score_kernel(
             queries
