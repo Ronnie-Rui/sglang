@@ -21,6 +21,7 @@ RUNTIME_SPARSE_BACKENDS_BY_ALGORITHM = {
 RUNTIME_SPARSE_ALGORITHMS = set(RUNTIME_SPARSE_BACKENDS_BY_ALGORITHM)
 RUNTIME_SPARSE_ATTENTION_BACKEND_ALIASES = {"flashattention": "fa3"}
 QUEST_MAX_SELECTED_TOKENS_OPTION = "quest_max_selected_tokens"
+QUEST_DENSE_FALLBACK_MAX_SEQ_LEN_OPTION = "dense_fallback_max_seq_len"
 
 
 def _load_hisparse_config(server_args: ServerArgs) -> dict:

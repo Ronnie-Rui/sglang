@@ -70,11 +70,13 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self._actual_selection_anchors = set()
         self._metadata_length_updates = {}
         self._last_metadata_layer = None
+        self._dense_forward_active = False
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
 
     def begin_forward(self, *args, **kwargs) -> None:
+        self._dense_forward_active = False
         self._selection_cache = None
         self._selection_cache_group = None
         self._selection_cache_layer = None
@@ -82,6 +84,19 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self._metadata_length_updates.clear()
         self._last_metadata_layer = None
         super().begin_forward(*args, **kwargs)
+
+    def begin_dense_forward(self, forward_batch) -> None:
+        self._dense_forward_active = True
+        self._selection_cache = None
+        self._selection_cache_group = None
+        self._selection_cache_layer = None
+        self._actual_selection_anchors.clear()
+        self._metadata_length_updates.clear()
+        self._last_metadata_layer = None
+        super().begin_dense_forward(forward_batch)
+
+    def prepare_graph_forward(self) -> None:
+        self._dense_forward_active = False
 
     def _get_layer_budget_scale(self, layer_id: int) -> float:
         for start_layer, end_layer, scale in self.layer_page_budget:
@@ -235,7 +250,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         # The lazy score kernel materializes pages that are safe before the
         # current attention write. The just-completed page is picked up by the
         # following decode step, so the regular updater must not race it.
-        if self._can_use_lazy_page_update(k_buffer):
+        if not self._dense_forward_active and self._can_use_lazy_page_update(k_buffer):
             return
         if not self.should_update_representations(forward_batch):
             return

@@ -401,6 +401,52 @@ def test_layer_ratio_is_applied_before_global_selected_token_cap():
     assert [base_plan.max_k, layer_plan.max_k] == [10, 4]
 
 
+def test_dense_forward_resets_selection_state_and_keeps_page_updates_live():
+    algorithm = _layer_policy_algorithm(interval=2)
+    algorithm.end_layer = 2
+    algorithm.states = SimpleNamespace(
+        repr_constructed=torch.tensor([True]),
+        last_constructed_page=torch.tensor([1]),
+    )
+    algorithm._selection_cache = (torch.tensor([[0]]), torch.tensor([1]))
+    algorithm._selection_cache_group = (0, 1.0)
+    algorithm._selection_cache_layer = 0
+    algorithm._actual_selection_anchors.add(0)
+    dense_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode=lambda: True),
+        seq_lens=torch.tensor([8]),
+        seq_lens_cpu=[8],
+        req_pool_indices=torch.tensor([0]),
+        spec_info=None,
+        num_token_non_padded_cpu=1,
+        positions=torch.tensor([7]),
+    )
+    algorithm.begin_dense_forward(dense_batch)
+
+    assert algorithm._dense_forward_active
+    assert algorithm._selection_cache is None
+    assert not algorithm._actual_selection_anchors
+
+    algorithm.prepare_graph_forward()
+    assert not algorithm._dense_forward_active
+    algorithm.begin_dense_forward(dense_batch)
+
+    with (
+        patch.object(algorithm, "_can_use_lazy_page_update", return_value=True),
+        patch.object(algorithm, "_compute_page_representations") as compute,
+    ):
+        algorithm.update_representations(
+            0,
+            dense_batch.req_pool_indices,
+            dense_batch.seq_lens,
+            torch.zeros((8, 1, 1)),
+            dense_batch,
+        )
+
+    compute.assert_called_once()
+    assert algorithm.states.last_constructed_page.tolist() == [2]
+
+
 def test_full_page_fast_path_and_partial_fallback_match_reference():
     algorithm = QuestAlgorithm(_config(), torch.device("cpu"))
     algorithm.req_to_token_pool = SimpleNamespace(

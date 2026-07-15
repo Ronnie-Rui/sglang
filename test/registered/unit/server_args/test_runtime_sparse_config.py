@@ -168,6 +168,40 @@ class TestRuntimeSparseConfig(unittest.TestCase):
                     }
                 )
 
+    def test_dense_fallback_defaults_off_and_accepts_non_negative_threshold(self):
+        default = self._parse({"algorithm": "quest", "backend": "fa3", "page_size": 16})
+        self.assertNotIn("dense_fallback_max_seq_len", default.sparse_extra_config)
+
+        for threshold in (0, 8192, 10240):
+            with self.subTest(threshold=threshold):
+                config = self._parse(
+                    {
+                        "algorithm": "quest",
+                        "backend": "fa3",
+                        "page_size": 16,
+                        "dense_fallback_max_seq_len": threshold,
+                    }
+                )
+                self.assertEqual(
+                    config.sparse_extra_config["dense_fallback_max_seq_len"],
+                    threshold,
+                )
+
+    def test_rejects_invalid_dense_fallback_threshold(self):
+        for threshold in (None, True, 8192.0, "8192", -1):
+            with (
+                self.subTest(threshold=threshold),
+                self.assertRaisesRegex(ValueError, "dense_fallback_max_seq_len"),
+            ):
+                self._parse(
+                    {
+                        "algorithm": "quest",
+                        "backend": "fa3",
+                        "page_size": 16,
+                        "dense_fallback_max_seq_len": threshold,
+                    }
+                )
+
 
 class TestRuntimeSparseCudaGraphDefaults(unittest.TestCase):
     def test_unlocked_defaults_use_breakable_decode_and_disable_prefill(self):

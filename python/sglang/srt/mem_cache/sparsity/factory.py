@@ -4,7 +4,10 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.arg_groups.hisparse_hook import QUEST_MAX_SELECTED_TOKENS_OPTION
+from sglang.srt.arg_groups.hisparse_hook import (
+    QUEST_DENSE_FALLBACK_MAX_SEQ_LEN_OPTION,
+    QUEST_MAX_SELECTED_TOKENS_OPTION,
+)
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_dsa import DeepSeekDSAAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
@@ -222,6 +225,21 @@ def parse_runtime_sparse_config(server_args) -> SparseConfig:
                 "Sparse runtime config quest_max_selected_tokens must include "
                 "all recent pages and at least one history page; expected at "
                 f"least {minimum_selected_tokens}, got {quest_max_selected_tokens}."
+            )
+
+    if QUEST_DENSE_FALLBACK_MAX_SEQ_LEN_OPTION in config.sparse_extra_config:
+        dense_fallback_max_seq_len = config.sparse_extra_config[
+            QUEST_DENSE_FALLBACK_MAX_SEQ_LEN_OPTION
+        ]
+        if (
+            not isinstance(dense_fallback_max_seq_len, int)
+            or isinstance(dense_fallback_max_seq_len, bool)
+            or dense_fallback_max_seq_len < 0
+        ):
+            raise ValueError(
+                "Sparse runtime config dense_fallback_max_seq_len must be a "
+                "non-negative integer, "
+                f"got {dense_fallback_max_seq_len!r}."
             )
 
     layer_selection_reuse_interval = config.sparse_extra_config.get(

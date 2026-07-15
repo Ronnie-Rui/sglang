@@ -78,6 +78,12 @@ class BaseSparseAlgorithm(ABC):
     ) -> None:
         """Prepare state shared by every sparse layer in one forward."""
 
+    def begin_dense_forward(self, forward_batch: "ForwardBatch") -> None:
+        """Prepare representation tracking without building a retrieval plan."""
+
+    def prepare_graph_forward(self) -> None:
+        """Prepare algorithm lifecycle state before graph replay."""
+
     def should_update_representations(self, forward_batch: "ForwardBatch") -> bool:
         return True
 
@@ -268,6 +274,14 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         self._retrieval_plans_by_ratio[self.sparsity_ratio] = self._retrieval_plan
         self._representation_update_due = self._has_completed_page(
             self._retrieval_plan.seq_lens_cpu
+        )
+
+    def begin_dense_forward(self, forward_batch: "ForwardBatch") -> None:
+        self._retrieval_plan = None
+        self._retrieval_plans_by_ratio.clear()
+        self._representation_update_batch = forward_batch
+        self._representation_update_due = self._decode_page_boundary_reached(
+            forward_batch
         )
 
     def get_selected_physical_pages(

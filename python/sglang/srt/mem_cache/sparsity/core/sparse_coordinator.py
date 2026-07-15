@@ -4,6 +4,9 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.arg_groups.hisparse_hook import (
+    QUEST_DENSE_FALLBACK_MAX_SEQ_LEN_OPTION,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
@@ -149,6 +152,7 @@ class SparseCoordinator:
             self.states,
         )
         self._forward_sparse_mask = None
+        self._forward_dense_fallback = False
 
         logger.info(
             f"SparseCoordinator initialized with sparse algorithm={type(algorithm).__name__}"
@@ -240,6 +244,60 @@ class SparseCoordinator:
             fixed_capacity=fixed_capacity,
         )
 
+    def _should_use_dense_fallback(
+        self,
+        forward_batch: "ForwardBatch",
+        *,
+        fixed_capacity: bool | int,
+    ) -> bool:
+        extra_config = getattr(getattr(self, "config", None), "sparse_extra_config", {})
+        threshold = extra_config.get(QUEST_DENSE_FALLBACK_MAX_SEQ_LEN_OPTION, 0)
+        if threshold <= 0 or fixed_capacity is not False:
+            return False
+        if not forward_batch.forward_mode.is_decode():
+            return False
+        if getattr(forward_batch, "runtime_sparse_page_capacity", None) is not None:
+            return False
+        if getattr(forward_batch, "spec_info", None) is not None:
+            return False
+
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            is_in_breakable_cuda_graph,
+        )
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            get_tc_piecewise_forward_context,
+            is_in_tc_piecewise_cuda_graph,
+        )
+
+        if (
+            is_in_breakable_cuda_graph()
+            or is_in_tc_piecewise_cuda_graph()
+            or get_tc_piecewise_forward_context() is not None
+        ):
+            return False
+        if (
+            torch.device(self.device).type == "cuda"
+            and torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        batch_size = forward_batch.req_pool_indices.numel()
+        if torch.is_tensor(seq_lens_cpu):
+            if seq_lens_cpu.device.type != "cpu" or seq_lens_cpu.numel() != batch_size:
+                return False
+            values = seq_lens_cpu.reshape(-1).tolist()
+        else:
+            try:
+                values = list(seq_lens_cpu)
+            except TypeError:
+                return False
+            if len(values) != batch_size:
+                return False
+
+        return bool(values) and max(int(value) for value in values) <= threshold
+
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """
         Handle forward pass end event. Called after each forward pass completes.
@@ -265,9 +323,14 @@ class SparseCoordinator:
 
     def prepare_graph_forward(self) -> None:
         self._forward_sparse_mask = None
+        self._forward_dense_fallback = False
+        self.algorithm.prepare_graph_forward()
 
     def finalize_forward(self, forward_batch: "ForwardBatch") -> None:
-        self.algorithm.finalize_forward(forward_batch)
+        try:
+            self.algorithm.finalize_forward(forward_batch)
+        finally:
+            self._forward_dense_fallback = False
 
     def attention_begin(
         self,
@@ -287,8 +350,18 @@ class SparseCoordinator:
         and adapt attention metadata for the attention backend.
         """
         if layer.layer_id == self.start_layer:
-            self.forward_begin(forward_batch, fixed_capacity=fixed_capacity)
-            self.backend_adaptor.save_original_metadata(attn_metadata)
+            self._forward_dense_fallback = self._should_use_dense_fallback(
+                forward_batch, fixed_capacity=fixed_capacity
+            )
+            if self._forward_dense_fallback:
+                self._forward_sparse_mask = None
+                self.algorithm.begin_dense_forward(forward_batch)
+            else:
+                self.forward_begin(forward_batch, fixed_capacity=fixed_capacity)
+                self.backend_adaptor.save_original_metadata(attn_metadata)
+
+        if self._forward_dense_fallback:
+            return attn_metadata
 
         return self._handle_sparse_retrieve(
             query, layer, forward_batch, attn_metadata, **kwargs
@@ -306,6 +379,18 @@ class SparseCoordinator:
         Maybe construct and update sparse representations.
         """
         layer_id = layer.layer_id
+
+        if self._forward_dense_fallback and forward_batch.forward_mode.is_decode():
+            if not self.algorithm.should_update_representations(forward_batch):
+                return
+            self.algorithm.update_representations(
+                layer_id=layer_id,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
+                forward_batch=forward_batch,
+            )
+            return
 
         # Maybe construct representations
         self.algorithm.construct_representations(
