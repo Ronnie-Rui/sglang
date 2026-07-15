@@ -205,6 +205,47 @@ def test_single_request_exact_host_false_skips_score_calculation():
     assert selected.tolist() == [[-1]]
 
 
+def test_single_request_applies_layer_ratio_and_selected_token_cap():
+    algorithm = QuestAlgorithm(
+        _config(
+            quest_max_selected_tokens=48,
+            layer_page_budget=[{"start_layer": 1, "end_layer": 2, "scale": 0.1}],
+        ),
+        torch.device("cpu"),
+    )
+    algorithm.start_layer = 0
+    algorithm.end_layer = 2
+    algorithm.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.arange(400, dtype=torch.int64).unsqueeze(0)
+    )
+    forward_batch = SimpleNamespace(seq_lens=torch.tensor([400]), seq_lens_cpu=[400])
+
+    with patch.object(
+        algorithm,
+        "_retrieve_page_scores",
+        side_effect=lambda _layer, pages, _reqs, _queries: pages.to(torch.float32),
+    ):
+        capped, capped_lengths = algorithm.retrieve_topk(
+            torch.zeros((1, 1)),
+            0,
+            torch.tensor([0]),
+            torch.tensor([True]),
+            forward_batch=forward_batch,
+        )
+        scaled, scaled_lengths = algorithm.retrieve_topk(
+            torch.zeros((1, 1)),
+            1,
+            torch.tensor([0]),
+            torch.tensor([True]),
+            forward_batch=forward_batch,
+        )
+
+    assert capped_lengths.tolist() == [12]
+    assert capped.tolist() == [list(range(88, 100))]
+    assert scaled_lengths.tolist() == [6]
+    assert scaled.tolist() == [list(range(94, 100))]
+
+
 def test_inactive_requests_do_not_inflate_host_topk_width():
     algorithm, all_inactive = _build_plan([2048, 1024], [False, False])
     assert all_inactive.max_k == 0

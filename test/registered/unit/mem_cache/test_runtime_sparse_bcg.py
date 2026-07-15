@@ -298,6 +298,9 @@ class TestDenseFallbackDispatch(unittest.TestCase):
 
     def test_gate_is_inclusive_for_an_entire_eager_batch(self):
         coordinator = self._coordinator()
+        self.assertTrue(coordinator.should_use_dense_fallback(self._batch([8, 7])))
+        self.assertFalse(coordinator.should_use_dense_fallback(self._batch([8, 9])))
+
         with (
             patch(
                 "sglang.srt.model_executor.runner_backend_utils."

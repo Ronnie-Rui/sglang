@@ -530,6 +530,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        coordinator = self._runtime_sparse_coordinator()
+        if coordinator is not None and coordinator.should_use_dense_fallback(
+            forward_batch
+        ):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
@@ -552,7 +558,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             cuda_graph_bs = forward_batch.batch_size
 
         sparse_page_capacity = self._select_sparse_graph_page_capacity(forward_batch)
-        coordinator = self._runtime_sparse_coordinator()
         is_sparse_capacity_supported = not (
             coordinator is not None
             and coordinator.enable_cuda_graph_retrieval

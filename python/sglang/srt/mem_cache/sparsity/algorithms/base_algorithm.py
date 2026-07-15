@@ -16,6 +16,16 @@ def _float32_scaled_count(count: int, ratio: float) -> int:
     return int(c_float(count_f32 * ratio_f32).value)
 
 
+def _selection_count(
+    history_count: int, ratio: float, history_page_cap: int | None = None
+) -> int:
+    count = min(
+        max(_float32_scaled_count(history_count, ratio), 1),
+        history_count,
+    )
+    return min(count, history_page_cap) if history_page_cap is not None else count
+
+
 @dataclass
 class _RetrievalPlan:
     """Layer-invariant inputs for one sparse decode forward."""
@@ -633,9 +643,10 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
 
         recent_start = num_pages - self.num_recent_pages
         history_pages = max(recent_start, 1)
-        k = min(
-            max(_float32_scaled_count(history_pages, self.sparsity_ratio), 1),
+        k = _selection_count(
             history_pages,
+            self.get_layer_sparsity_ratio(layer_id),
+            self.get_history_page_selection_cap(),
         )
         topk_idx = torch.topk(
             scores[:, :recent_start], k=k, dim=1, sorted=False
@@ -810,18 +821,13 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             k_per_req = torch.clamp(k_per_req, max=history_page_cap)
         k_per_req = torch.where(active_mask, k_per_req, torch.zeros_like(k_per_req))
 
-        def selection_count(history_count: int) -> int:
-            count = min(
-                max(_float32_scaled_count(history_count, ratio), 1),
-                history_count,
-            )
-            return (
-                min(count, history_page_cap) if history_page_cap is not None else count
-            )
-
         if fixed_capacity:
             history_capacity = max(max_num_pages - self.num_recent_pages, 0)
-            max_k = selection_count(history_capacity) if history_capacity > 0 else 0
+            max_k = (
+                _selection_count(history_capacity, ratio, history_page_cap)
+                if history_capacity > 0
+                else 0
+            )
             score_order_required = True
         elif num_pages_cpu is not None:
             k_per_req_cpu = []
@@ -831,7 +837,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
                 )
                 history_count = max(count - self.num_recent_pages, 0)
                 k_per_req_cpu.append(
-                    selection_count(history_count)
+                    _selection_count(history_count, ratio, history_page_cap)
                     if is_sparse and history_count > 0
                     else 0
                 )

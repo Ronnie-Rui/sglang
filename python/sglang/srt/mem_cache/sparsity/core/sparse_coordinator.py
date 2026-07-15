@@ -244,21 +244,44 @@ class SparseCoordinator:
             fixed_capacity=fixed_capacity,
         )
 
+    def should_use_dense_fallback(self, forward_batch: "ForwardBatch") -> bool:
+        """Return the host-only dense fallback decision for a scheduler batch."""
+        extra_config = getattr(getattr(self, "config", None), "sparse_extra_config", {})
+        threshold = extra_config.get(QUEST_DENSE_FALLBACK_MAX_SEQ_LEN_OPTION, 0)
+        if threshold <= 0:
+            return False
+        if not forward_batch.forward_mode.is_decode():
+            return False
+        if getattr(forward_batch, "spec_info", None) is not None:
+            return False
+
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        batch_size = forward_batch.req_pool_indices.numel()
+        if torch.is_tensor(seq_lens_cpu):
+            if seq_lens_cpu.device.type != "cpu" or seq_lens_cpu.numel() != batch_size:
+                return False
+            values = seq_lens_cpu.reshape(-1).tolist()
+        else:
+            try:
+                values = list(seq_lens_cpu)
+            except TypeError:
+                return False
+            if len(values) != batch_size:
+                return False
+
+        return bool(values) and max(int(value) for value in values) <= threshold
+
     def _should_use_dense_fallback(
         self,
         forward_batch: "ForwardBatch",
         *,
         fixed_capacity: bool | int,
     ) -> bool:
-        extra_config = getattr(getattr(self, "config", None), "sparse_extra_config", {})
-        threshold = extra_config.get(QUEST_DENSE_FALLBACK_MAX_SEQ_LEN_OPTION, 0)
-        if threshold <= 0 or fixed_capacity is not False:
-            return False
-        if not forward_batch.forward_mode.is_decode():
+        if fixed_capacity is not False:
             return False
         if getattr(forward_batch, "runtime_sparse_page_capacity", None) is not None:
             return False
-        if getattr(forward_batch, "spec_info", None) is not None:
+        if not self.should_use_dense_fallback(forward_batch):
             return False
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -282,21 +305,7 @@ class SparseCoordinator:
         ):
             return False
 
-        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-        batch_size = forward_batch.req_pool_indices.numel()
-        if torch.is_tensor(seq_lens_cpu):
-            if seq_lens_cpu.device.type != "cpu" or seq_lens_cpu.numel() != batch_size:
-                return False
-            values = seq_lens_cpu.reshape(-1).tolist()
-        else:
-            try:
-                values = list(seq_lens_cpu)
-            except TypeError:
-                return False
-            if len(values) != batch_size:
-                return False
-
-        return bool(values) and max(int(value) for value in values) <= threshold
+        return True
 
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """
