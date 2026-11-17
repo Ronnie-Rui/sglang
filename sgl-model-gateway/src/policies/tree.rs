@@ -782,8 +782,11 @@ impl Tree {
             // Remove empty nodes
             if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
                 if let Some(ref parent) = parent_opt {
-                    if let Some(fc) = node.text.read().unwrap().first_char() {
-                        parent.children.remove(&fc);
+                    let first_char = node.text.read().unwrap().first_char();
+                    if let Some(fc) = first_char {
+                        parent
+                            .children
+                            .remove_if(&fc, |_, child| Arc::ptr_eq(child, &node));
                     }
                 }
             }
@@ -862,8 +865,11 @@ impl Tree {
             // Remove empty nodes
             if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
                 if let Some(ref parent) = parent_opt {
-                    if let Some(fc) = curr.text.read().unwrap().first_char() {
-                        parent.children.remove(&fc);
+                    let first_char = curr.text.read().unwrap().first_char();
+                    if let Some(fc) = first_char {
+                        parent
+                            .children
+                            .remove_if(&fc, |_, child| Arc::ptr_eq(child, &curr));
                     }
                 }
             }
